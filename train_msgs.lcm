@@ -1,0 +1,10 @@
+package train_msgs;
+
+struct TrainStatus {
+  int64_t timestamp;
+  int32_t epoch;
+  int32_t step;
+  double loss;
+  double reward;
+  double lr;
+}
