@@ -165,6 +165,11 @@ async def google_auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if user_key is None:
         await update.message.reply_text("无法识别用户，请在私聊或群组中直接使用 /google_auth。")
         return
+
+    existing_entry = PENDING_OAUTH_FLOWS.pop(user_key, None)
+    if existing_entry:
+        await _delete_auth_prompt(context, existing_entry)
+
     client_secrets_path = GOOGLE_SETTINGS.get("client_secrets_path")
     if not client_secrets_path:
         await update.message.reply_text("缺少 google.client_secrets_path，请先在 config.yaml 中配置。")
@@ -182,7 +187,9 @@ async def google_auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"生成授权链接失败：{exc}")
         return
 
+    status_line = "当前状态：已授权 ✅（可重新授权）" if ASSISTANT else "当前状态：尚未授权 ❌"
     sent_message = await update.message.reply_text(
+        f"{status_line}\n\n"
         "请打开以下链接完成 Google 授权：\n\n"
         f"{auth_url}\n\n"
         "授权完成后，Google 页面会显示一段 code。复制该 code 后发送命令：\n"
