@@ -130,16 +130,79 @@ class OpenAIEventParser:
         return prompt
 
     def _response_to_text(self, response) -> str:
-        chunks = []
-        for item in getattr(response, "output", []):
-            for content in getattr(item, "content", []):
-                if getattr(content, "type", "") == "output_text":
-                    chunks.append(content.text)
-        if not chunks and hasattr(response, "choices"):
-            # Fallback for compatibility with older SDKs
-            for choice in response.choices:
-                chunks.append(choice.message.content)
-        return "\n".join(chunks).strip()
+        # 1) Prefer unified field if present (some providers expose output_text)
+        unified_text = getattr(response, "output_text", None)
+        if isinstance(unified_text, str) and unified_text.strip():
+            return unified_text.strip()
+
+        # 2) Responses API: response.output -> list of items, each with .content (list) or .content == None
+        chunks: List[str] = []
+        output_items = getattr(response, "output", None)
+        if output_items:
+            try:
+                for item in output_items:
+                    contents = getattr(item, "content", None)
+                    if isinstance(contents, list):
+                        for content in contents:
+                            if getattr(content, "type", "") == "output_text":
+                                text_val = getattr(content, "text", "")
+                                if isinstance(text_val, str) and text_val:
+                                    chunks.append(text_val)
+                    elif isinstance(contents, str):
+                        chunks.append(contents)
+                    # ignore None or unexpected shapes
+            except TypeError:
+                # In case output_items is not iterable or malformed, ignore and fall back
+                pass
+        if chunks:
+            return "\n".join(chunks).strip()
+
+        # 3) Chat Completions-style fallback
+        if hasattr(response, "choices"):
+            try:
+                for choice in response.choices:
+                    message = getattr(choice, "message", None)
+                    if message:
+                        content = getattr(message, "content", None)
+                        if isinstance(content, str) and content.strip():
+                            chunks.append(content)
+                    # some SDKs use 'text'
+                    text_val = getattr(choice, "text", None)
+                    if isinstance(text_val, str) and text_val.strip():
+                        chunks.append(text_val)
+                if chunks:
+                    return "\n".join(chunks).strip()
+            except Exception:
+                pass
+
+        # 4) Dict-based fallbacks (if a raw dict leaked through)
+        if isinstance(response, dict):
+            # OpenAI chat completions
+            if isinstance(response.get("choices"), list):
+                for choice in response["choices"]:
+                    msg = choice.get("message") or {}
+                    content = msg.get("content") or choice.get("text")
+                    if isinstance(content, str) and content.strip():
+                        chunks.append(content)
+                if chunks:
+                    return "\n".join(chunks).strip()
+            # Responses API-like
+            if isinstance(response.get("output"), list):
+                for item in response["output"]:
+                    contents = item.get("content")
+                    if isinstance(contents, list):
+                        for content in contents:
+                            if content.get("type") == "output_text":
+                                t = content.get("text", "")
+                                if isinstance(t, str) and t:
+                                    chunks.append(t)
+                    elif isinstance(contents, str):
+                        chunks.append(contents)
+                if chunks:
+                    return "\n".join(chunks).strip()
+
+        # Nothing found; return empty string to let caller handle
+        return ""
 
     def _extract_json(self, raw_text: str):
         normalized = self._strip_code_fences(raw_text)

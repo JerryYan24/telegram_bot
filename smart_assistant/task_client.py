@@ -90,11 +90,33 @@ class GoogleTaskClient:
         if normalized in mapping:
             return mapping[normalized]
 
-        # If presets are defined, only allow creating names in presets
+        # If presets are defined, restrict to presets only
         if self._preset_names and normalized not in self._preset_names:
-            similar = self._pick_similar_list(normalized, mapping)
-            if similar:
-                return similar
+            # Ensure presets exist in mapping (may create up to limit)
+            try:
+                self._ensure_preset_lists()
+                mapping = self._list_cache_by_name or mapping
+            except Exception:
+                pass
+            # Pick the closest preset name, not arbitrary existing lists
+            preset_choice = self._pick_closest_name(normalized, self._preset_names)
+            if preset_choice:
+                # Return its id (ensure cache updated)
+                if preset_choice in mapping:
+                    return mapping[preset_choice]
+                # Create it if not present and under cap
+                if len(mapping) < self._max_lists:
+                    try:
+                        created = self.service.tasklists().insert(body={"title": preset_choice}).execute()
+                        created_id = created.get("id")
+                        if created_id:
+                            self._list_cache_by_name[preset_choice] = created_id
+                            return created_id
+                    except HttpError:
+                        pass
+                # As last resort, fall back to configured default
+                return self._get_fallback_list_id()
+            # No reasonable preset match; fall back to default
             return self._get_fallback_list_id()
 
         # Enforce max list count: if already at cap, fallback to best existing
@@ -119,6 +141,33 @@ class GoogleTaskClient:
             # fall through to fallback
         return self._get_fallback_list_id()
 
+    def _pick_closest_name(self, candidate: str, options: Set[str]) -> Optional[str]:
+        """Pick the closest name from options using simple heuristics."""
+        if not options:
+            return None
+        # Exact
+        if candidate in options:
+            return candidate
+        # Prefix/suffix containment
+        for opt in options:
+            if candidate in opt or opt in candidate:
+                return opt
+        # Small Levenshtein-like heuristic (length diff and common prefix)
+        best = None
+        best_score = -1
+        for opt in options:
+            common_prefix = 0
+            for a, b in zip(candidate, opt):
+                if a == b:
+                    common_prefix += 1
+                else:
+                    break
+            score = common_prefix - abs(len(candidate) - len(opt))
+            if score > best_score:
+                best_score = score
+                best = opt
+        return best
+
     def _ensure_preset_lists(self) -> None:
         if not self._preset_names:
             return
@@ -139,7 +188,7 @@ class GoogleTaskClient:
                 self.logger.warning("Unable to create preset task list '%s': %s", preset, exc)
 
     def _pick_similar_list(self, normalized: str, mapping: Dict[str, str]) -> Optional[str]:
-        # Exact match already handled; try simple heuristics
+        # Exact match already handled; try simple heuristics among existing lists
         for existing_name, list_id in mapping.items():
             if existing_name == normalized:
                 return list_id
@@ -147,10 +196,6 @@ class GoogleTaskClient:
         for existing_name, list_id in mapping.items():
             if normalized in existing_name or existing_name in normalized:
                 return list_id
-        # Common buckets
-        for bucket in ("work", "personal", "meeting", "travel", "study", "finance", "family", "health", "other"):
-            if bucket in mapping and (normalized.startswith(bucket) or bucket in normalized):
-                return mapping[bucket]
         return None
 
     def _build_task_link(self, created: dict) -> str:
