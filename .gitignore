@@ -56,3 +56,4 @@ google_*.json
 *_token.json
 *_secret*.json
 model_state.json
+usage_stats.json

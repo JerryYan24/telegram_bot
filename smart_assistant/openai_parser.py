@@ -138,29 +138,35 @@ class OpenAIEventParser:
 
     def _run_completion(self, model: str, user_content):
         system_prompt = self._build_system_prompt()
-        response = self.client.responses.create(
-            model=model,
-            input=[
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {"role": "user", "content": user_content},
-            ],
-        )
-        # Update token usage counters if available
+        # Try Responses API first
         try:
-            prompt_toks, completion_toks, total_toks = self._extract_usage(response)
-            if prompt_toks or completion_toks or total_toks:
-                bucket = self.usage_by_model.setdefault(model, {"prompt": 0, "completion": 0, "total": 0})
-                bucket["prompt"] += prompt_toks
-                bucket["completion"] += completion_toks
-                bucket["total"] += (total_toks or (prompt_toks + completion_toks))
-                self._persist_usage()
+            response = self.client.responses.create(
+                model=model,
+                input=[
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                    {"role": "user", "content": user_content},
+                ],
+            )
+            # Update token usage counters if available
+            try:
+                prompt_toks, completion_toks, total_toks = self._extract_usage(response)
+                if prompt_toks or completion_toks or total_toks:
+                    bucket = self.usage_by_model.setdefault(model, {"prompt": 0, "completion": 0, "total": 0})
+                    bucket["prompt"] += prompt_toks
+                    bucket["completion"] += completion_toks
+                    bucket["total"] += (total_toks or (prompt_toks + completion_toks))
+                    self._persist_usage()
+            except Exception:
+                pass
+            text = self._response_to_text(response)
+            return self._extract_json(text)
         except Exception:
-            pass
-        text = self._response_to_text(response)
-        return self._extract_json(text)
+            # Fallback to Chat Completions for gateways (e.g., Gemini proxy) that don't implement Responses API
+            text = self._fallback_chat_completion(model, system_prompt, user_content)
+            return self._extract_json(text)
 
     def _build_system_prompt(self) -> str:
         prompt = PROMPT_TEMPLATE.format(default_timezone=self.default_timezone)
@@ -197,6 +203,113 @@ class OpenAIEventParser:
         )
         text = self._response_to_text(response)
         return (text or "").strip()
+
+    def map_task_to_allowed(self, title: str, notes: str = "") -> tuple[str, str]:
+        """
+        Ask model to map a free-form task into one of the allowed task lists.
+        Returns (category, task_list) both guaranteed to be within allowed_task_lists if possible; else empty strings.
+        """
+        presets = [s.strip() for s in (self.allowed_task_lists or []) if str(s).strip()]
+        if not presets:
+            return "", ""
+        system_prompt = "You assign tasks to one of the provided allowed lists."
+        allowed_str = ", ".join(f'"{p}"' for p in presets)
+        user_text_parts = [
+            "Given a task title and optional notes, choose the BEST matching category/list strictly from this set: ",
+            f"[{allowed_str}]. Respond with compact JSON containing keys: category, task_list (both strings). ",
+            "Do not invent names outside the set. If multiple fit, pick the most specific.",
+            f"\n\nTitle: {title}\nNotes: {notes or ''}",
+        ]
+        user_text = "".join(user_text_parts)
+        # Prefer Responses API
+        try:
+            response = self.client.responses.create(
+                model=self.text_model,
+                input=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": [{"type": "input_text", "text": user_text}]},
+                ],
+            )
+            text = self._response_to_text(response)
+        except Exception:
+            text = self._fallback_chat_completion(
+                self.text_model,
+                system_prompt,
+                [{"type": "input_text", "text": user_text}],
+            )
+        try:
+            data = self._extract_json(text)
+            cat = (data.get("category") or "").strip().lower()
+            lst = (data.get("task_list") or "").strip().lower()
+            if cat in [p.lower() for p in presets]:
+                return cat, cat if not lst or lst not in [p.lower() for p in presets] else lst
+            if lst in [p.lower() for p in presets]:
+                return lst, lst
+        except Exception:
+            pass
+        return "", ""
+
+    def _fallback_chat_completion(self, model: str, system_prompt: str, user_content) -> str:
+        """Fallback path using chat.completions when Responses API is not available."""
+        # Convert user_content into Chat Completions format
+        # user_content can be:
+        # - [{"type":"input_text","text": "..."}]
+        # - [{"type":"input_text",...}, {"type":"input_image","image_url": {...}}]
+        user_message_content = []
+        if isinstance(user_content, list):
+            for item in user_content:
+                item_type = item.get("type")
+                if item_type in ("input_text", "text"):
+                    text_val = item.get("text") or item.get("content") or ""
+                    if text_val:
+                        user_message_content.append({"type": "text", "text": text_val})
+                elif item_type in ("input_image", "image_url", "image"):
+                    image_url = item.get("image_url") or item.get("url") or {}
+                    if isinstance(image_url, dict) and image_url.get("url"):
+                        user_message_content.append({"type": "image_url", "image_url": {"url": image_url["url"]}})
+        else:
+            # Plain string as content
+            if isinstance(user_content, str) and user_content.strip():
+                user_message_content.append({"type": "text", "text": user_content})
+
+        # Some gateways require content to be a string; fallback to joining texts
+        messages = [{"role": "system", "content": system_prompt}]
+        if user_message_content:
+            messages.append({"role": "user", "content": user_message_content})
+        else:
+            messages.append({"role": "user", "content": system_prompt})
+
+        try:
+            chat = self.client.chat.completions.create(model=model, messages=messages)
+            # Update usage if available
+            try:
+                prompt_toks, completion_toks, total_toks = self._extract_usage(chat)
+                if prompt_toks or completion_toks or total_toks:
+                    bucket = self.usage_by_model.setdefault(model, {"prompt": 0, "completion": 0, "total": 0})
+                    bucket["prompt"] += prompt_toks
+                    bucket["completion"] += completion_toks
+                    bucket["total"] += (total_toks or (prompt_toks + completion_toks))
+                    self._persist_usage()
+            except Exception:
+                pass
+            # Extract text
+            if hasattr(chat, "choices") and chat.choices:
+                choice = chat.choices[0]
+                msg = getattr(choice, "message", None)
+                if msg and getattr(msg, "content", None):
+                    return msg.content
+                if getattr(choice, "text", None):
+                    return choice.text
+            # Dict fallback
+            if isinstance(chat, dict):
+                ch = chat.get("choices") or []
+                if ch:
+                    msg = (ch[0].get("message") or {})
+                    content = msg.get("content") or ch[0].get("text") or ""
+                    return content or ""
+        except Exception:
+            pass
+        return ""
 
     def _response_to_text(self, response) -> str:
         # 1) Prefer unified field if present (some providers expose output_text)

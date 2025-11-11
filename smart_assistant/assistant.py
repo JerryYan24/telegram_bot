@@ -111,6 +111,27 @@ class CalendarAutomationAssistant:
                 self.logger.warning("Task client not configured; %d tasks ignored.", len(tasks))
             else:
                 for task in tasks:
+                    # Enforce task category/list to be within allowed presets if configured
+                    try:
+                        presets = [s.strip().lower() for s in (self.parser.allowed_task_lists or []) if str(s).strip()]
+                    except Exception:
+                        presets = []
+                    if presets:
+                        cat = (task.category or "").strip().lower()
+                        lst = (task.list_name or "").strip().lower()
+                        if (cat and cat not in presets) or (lst and lst not in presets) or (not cat and not lst):
+                            try:
+                                mapped_cat, mapped_list = self.parser.map_task_to_allowed(task.title, task.notes)
+                                if mapped_cat:
+                                    task.category = mapped_cat
+                                if mapped_list:
+                                    task.list_name = mapped_list
+                                # Final normalization
+                                if not task.list_name and task.category:
+                                    task.list_name = task.category
+                            except Exception:
+                                # If mapping fails, keep original and let client fallback
+                                pass
                     try:
                         link = self.task_client.create_task(task)
                         created_tasks.append((task, link))
