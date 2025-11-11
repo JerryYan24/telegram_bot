@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from functools import partial
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -45,7 +45,7 @@ DEFAULT_TIMEZONE: str = "UTC"
 PARSER: Optional[OpenAIEventParser] = None
 GOOGLE_SETTINGS: Dict[str, object] = {}
 EMAIL_SETTINGS: Dict[str, object] = {}
-PENDING_OAUTH_FLOWS: Dict[int, InstalledAppFlow] = {}
+PENDING_OAUTH_FLOWS: Dict[int, Dict[str, object]] = {}
 OOB_REDIRECT_URI = "urn:ietf:wg:oauth:2.0:oob"
 
 
@@ -182,14 +182,19 @@ async def google_auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"生成授权链接失败：{exc}")
         return
 
-    PENDING_OAUTH_FLOWS[user_key] = flow
-    await update.message.reply_text(
+    sent_message = await update.message.reply_text(
         "请打开以下链接完成 Google 授权：\n\n"
         f"{auth_url}\n\n"
         "授权完成后，Google 页面会显示一段 code。复制该 code 后发送命令：\n"
         "/google_auth_code <code>\n\n"
         "如果需要重新开始，可再次发送 /google_auth。"
     )
+    PENDING_OAUTH_FLOWS[user_key] = {
+        "flow": flow,
+        "message_id": sent_message.message_id,
+        "chat_id": sent_message.chat_id,
+        "expires_at": datetime.now(timezone.utc) + timedelta(minutes=2),
+    }
 
 
 async def google_auth_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -197,54 +202,24 @@ async def google_auth_code_command(update: Update, context: ContextTypes.DEFAULT
     if user_key is None:
         await update.message.reply_text("无法识别用户，请在私聊或群组中直接使用 /google_auth_code。")
         return
-    flow = PENDING_OAUTH_FLOWS.get(user_key)
-    if not flow:
-        await update.message.reply_text("没有待处理的授权请求，请先发送 /google_auth 获取链接。")
-        return
     if not context.args:
         await update.message.reply_text("请在命令后附上 Google 页面显示的 code。")
         return
 
     raw_code = " ".join(context.args).strip()
-    code = GoogleCalendarClient._extract_code(raw_code)
-    if not code:
-        await update.message.reply_text("未检测到有效的 code，请直接粘贴 Google 页面显示的字符串。")
-        return
-
-    try:
-        flow.fetch_token(code=code)
-    except Exception as exc:
-        logger.exception("Failed to exchange OAuth code")
-        PENDING_OAUTH_FLOWS.pop(user_key, None)
-        await update.message.reply_text(f"换取 token 失败：{exc}\n请重新发送 /google_auth 再试。")
-        return
-
-    creds = flow.credentials
-    PENDING_OAUTH_FLOWS.pop(user_key, None)
-    try:
-        _persist_credentials(creds)
-    except Exception as exc:
-        logger.exception("Failed to persist OAuth token")
-        await update.message.reply_text(f"保存 token 失败：{exc}")
-        return
-
-    try:
-        calendar_client = GoogleCalendarClient(
-            calendar_id=GOOGLE_SETTINGS.get("calendar_id", "primary"),
-            client_secrets_path=GOOGLE_SETTINGS.get("client_secrets_path"),
-            token_path=GOOGLE_SETTINGS.get("token_path", "google_token.json"),
-            credentials=creds,
-        )
-    except Exception as exc:
-        logger.exception("Failed to build Google Calendar client after OAuth")
-        await update.message.reply_text(f"初始化 Google Calendar 失败：{exc}")
-        return
-
-    _initialize_assistant(calendar_client)
-    await update.message.reply_text("Google 授权成功，现在可以开始创建日程了！")
+    await _process_oauth_code(user_key, raw_code, update, context, invoked_from_command=True)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_key = _flow_owner_id(update)
+    if user_key is not None:
+        raw_text = (update.message.text or "").strip()
+        if raw_text and user_key in PENDING_OAUTH_FLOWS:
+            handled = await _process_oauth_code(
+                user_key, raw_text, update, context, invoked_from_command=False
+            )
+            if handled:
+                return
     if not ASSISTANT:
         await update.message.reply_text("助手尚未初始化，请先发送 /google_auth 完成授权。")
         return
@@ -324,6 +299,80 @@ def _persist_credentials(creds: Credentials) -> None:
     token_file.parent.mkdir(parents=True, exist_ok=True)
     token_file.write_text(creds.to_json())
     logger.info("Saved Google OAuth token to %s", token_file)
+
+
+async def _process_oauth_code(
+    user_key: int,
+    raw_code: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    invoked_from_command: bool,
+) -> bool:
+    entry = PENDING_OAUTH_FLOWS.get(user_key)
+    if not entry:
+        if invoked_from_command:
+            await update.message.reply_text("没有待处理的授权请求，请先发送 /google_auth 获取链接。")
+        return False
+
+    expires_at = entry.get("expires_at")
+    if expires_at and datetime.now(timezone.utc) > expires_at:
+        await _delete_auth_prompt(context, entry)
+        PENDING_OAUTH_FLOWS.pop(user_key, None)
+        await update.message.reply_text("授权请求已过期，请重新发送 /google_auth。")
+        return True
+
+    code = GoogleCalendarClient._extract_code(raw_code)
+    if not code:
+        await update.message.reply_text("未检测到有效的 code，请直接粘贴 Google 页面显示的字符串。")
+        return True
+
+    flow: InstalledAppFlow = entry["flow"]
+    try:
+        flow.fetch_token(code=code)
+    except Exception as exc:
+        logger.exception("Failed to exchange OAuth code")
+        PENDING_OAUTH_FLOWS.pop(user_key, None)
+        await _delete_auth_prompt(context, entry)
+        await update.message.reply_text(f"换取 token 失败：{exc}\n请重新发送 /google_auth 再试。")
+        return True
+
+    creds = flow.credentials
+    PENDING_OAUTH_FLOWS.pop(user_key, None)
+    await _delete_auth_prompt(context, entry)
+    try:
+        _persist_credentials(creds)
+    except Exception as exc:
+        logger.exception("Failed to persist OAuth token")
+        await update.message.reply_text(f"保存 token 失败：{exc}")
+        return True
+
+    try:
+        calendar_client = GoogleCalendarClient(
+            calendar_id=GOOGLE_SETTINGS.get("calendar_id", "primary"),
+            client_secrets_path=GOOGLE_SETTINGS.get("client_secrets_path"),
+            token_path=GOOGLE_SETTINGS.get("token_path", "google_token.json"),
+            credentials=creds,
+        )
+    except Exception as exc:
+        logger.exception("Failed to build Google Calendar client after OAuth")
+        await update.message.reply_text(f"初始化 Google Calendar 失败：{exc}")
+        return True
+
+    _initialize_assistant(calendar_client)
+    await update.message.reply_text("Google 授权成功，现在可以开始创建日程了！")
+    return True
+
+
+async def _delete_auth_prompt(context: ContextTypes.DEFAULT_TYPE, entry: Dict[str, object]) -> None:
+    chat_id = entry.get("chat_id")
+    message_id = entry.get("message_id")
+    if not chat_id or not message_id:
+        return
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        logger.debug("Failed to delete auth prompt message for chat %s", chat_id)
 
 
 def _initialize_assistant(calendar_client: GoogleCalendarClient) -> None:
