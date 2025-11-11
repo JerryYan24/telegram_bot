@@ -92,7 +92,7 @@ cp config.example.yaml config.yaml
 3. 运行 `python jarvis.py` 启动机器人。
 4. 在 Telegram 与机器人对话中发送 `/google_auth`，它会回复一条授权链接。
 5. 在浏览器里完成 Google 登录并允许访问后，复制回调页面的整条链接或 `code=...` 参数。
-6. 回到 Telegram，把页面上显示的 code 原样发送过去（直接粘贴或使用 `/google_auth_code <code>` 均可）。收到成功提示后，令牌会写入 `google.token_path`（默认 `google_token.json`）。下次启动会自动复用，无需再次授权。
+6. 回到 Telegram，把页面上显示的 code 原样发送过去（直接粘贴或使用 `/google_auth_code <code>` 均可）。收到成功提示后，令牌会写入 `google.token_path`（默认 `google_token.json`）。下次启动会自动复用，无需再次授权；如需中途取消，可以点聊天里附带的“取消本次授权”按钮再次开始。
 
 ### 颜色分类
 助手会让模型为每个事件打 `category` 标签，并根据以下默认映射写入 Google Calendar `colorId`：

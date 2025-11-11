@@ -11,9 +11,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -188,13 +189,17 @@ async def google_auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     status_line = "当前状态：已授权 ✅（可重新授权）" if ASSISTANT else "当前状态：尚未授权 ❌"
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("取消本次授权", callback_data="cancel_oauth")]]
+    )
     sent_message = await update.message.reply_text(
         f"{status_line}\n\n"
         "请打开以下链接完成 Google 授权：\n\n"
         f"{auth_url}\n\n"
         "授权完成后，Google 页面会显示一段 code。复制该 code 后发送命令：\n"
         "/google_auth_code <code>\n\n"
-        "如果需要重新开始，可再次发送 /google_auth。"
+        "如果需要重新开始，可再次发送 /google_auth。",
+        reply_markup=keyboard,
     )
     PENDING_OAUTH_FLOWS[user_key] = {
         "flow": flow,
@@ -288,6 +293,29 @@ async def reply_with_result(update: Update, result: AssistantResult):
     else:
         message = result.message
     await update.message.reply_text(message)
+
+
+async def cancel_google_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    user = query.from_user
+    user_key = user.id if user else None
+    if user_key is None:
+        await query.edit_message_text("无法识别用户，取消操作失败。")
+        return
+    entry = PENDING_OAUTH_FLOWS.pop(user_key, None)
+    if not entry:
+        try:
+            await query.edit_message_text("当前没有待取消的授权请求。")
+        except Exception:
+            pass
+        return
+    chat_id = entry.get("chat_id")
+    await _delete_auth_prompt(context, entry)
+    if chat_id:
+        await context.bot.send_message(chat_id, "已取消本次 Google 授权请求。")
 
 
 def _flow_owner_id(update: Update) -> Optional[int]:
@@ -447,6 +475,7 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("google_auth", google_auth_command))
     application.add_handler(CommandHandler("google_auth_code", google_auth_code_command))
+    application.add_handler(CallbackQueryHandler(cancel_google_auth, pattern="^cancel_oauth$"))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
