@@ -28,7 +28,7 @@ Always respond with valid JSON. Use this schema:
   "description": string,
   "attendees": list of email strings,
   "all_day": bool,
-  "category": string (lowercase classification such as work, meeting, personal, travel, study, finance, family, health, reminder, other),
+  "category": string (lowercase classification such as work, meeting, personal, travel, study, finance, family, health, shopping, reminder, other),
   "color": string (optional color hint when the user explicitly specifies one, e.g. "red", "blue", "green"),
   "task_due": ISO 8601 datetime or date string (only for tasks; leave empty if not provided),
   "task_notes": string (task-specific notes or action items),
@@ -51,10 +51,14 @@ class OpenAIEventParser:
         text_model: str = "gpt-4o-mini",
         vision_model: Optional[str] = None,
         base_url: Optional[str] = None,
+        allowed_task_lists: Optional[List[str]] = None,
+        allowed_event_categories: Optional[List[str]] = None,
     ):
         self.default_timezone = default_timezone
         self.text_model = text_model
         self.vision_model = vision_model or text_model
+        self.allowed_task_lists = [s.strip() for s in (allowed_task_lists or []) if str(s).strip()]
+        self.allowed_event_categories = [s.strip() for s in (allowed_event_categories or []) if str(s).strip()]
         client_kwargs = {"api_key": api_key}
         if base_url:
             client_kwargs["base_url"] = base_url
@@ -94,18 +98,36 @@ class OpenAIEventParser:
         return self._payload_to_items(payload)
 
     def _run_completion(self, model: str, user_content):
+        system_prompt = self._build_system_prompt()
         response = self.client.responses.create(
             model=model,
             input=[
                 {
                     "role": "system",
-                    "content": PROMPT_TEMPLATE.format(default_timezone=self.default_timezone),
+                    "content": system_prompt,
                 },
                 {"role": "user", "content": user_content},
             ],
         )
         text = self._response_to_text(response)
         return self._extract_json(text)
+
+    def _build_system_prompt(self) -> str:
+        prompt = PROMPT_TEMPLATE.format(default_timezone=self.default_timezone)
+        guidance_parts: List[str] = []
+        if self.allowed_event_categories:
+            cats_str = ", ".join(f'"{name}"' for name in self.allowed_event_categories)
+            guidance_parts.append(
+                f"When entry_type is \"event\", choose category only from: [{cats_str}]."
+            )
+        if self.allowed_task_lists:
+            lists_str = ", ".join(f'"{name}"' for name in self.allowed_task_lists)
+            guidance_parts.append(
+                f"When entry_type is \"task\", choose category/task_list only from: [{lists_str}]. Avoid inventing new names; if unsure, pick the closest."
+            )
+        if guidance_parts:
+            prompt = prompt + "\n" + " ".join(guidance_parts)
+        return prompt
 
     def _response_to_text(self, response) -> str:
         chunks = []
@@ -230,6 +252,18 @@ class OpenAIEventParser:
         timezone = payload.get("timezone") or self.default_timezone
         due_str = payload.get("task_due") or payload.get("due") or ""
         notes = payload.get("task_notes") or payload.get("description") or ""
+        category = (payload.get("category") or payload.get("classification") or payload.get("type") or "").strip()
+        task_list_name = (payload.get("task_list") or "").strip()
+        # If user didn't specify a list but we have a category, use category as list hint
+        if not task_list_name and category:
+            task_list_name = category
+        # Heuristic: shopping-related titles/notes should go to 'shopping'
+        shopping_keywords = ["buy", "purchase", "grocery", "购物", "购买", "采购", "清单", "买", "囤货"]
+        text_blob = f"{title} {notes}".lower()
+        if any(kw in text_blob for kw in shopping_keywords):
+            category = "shopping"
+            if not task_list_name:
+                task_list_name = "shopping"
         due_dt: Optional[datetime] = None
         if due_str:
             try:
@@ -242,6 +276,8 @@ class OpenAIEventParser:
             due=due_dt,
             timezone=timezone,
             notes=notes.strip(),
+            category=category.lower(),
+            list_name=task_list_name,
         )
 
     def _parse_datetime(self, value: str, fallback_tz: str) -> datetime:

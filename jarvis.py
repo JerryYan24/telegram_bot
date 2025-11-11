@@ -121,6 +121,8 @@ def bootstrap() -> None:
         base_url=openai_base_url,
         text_model=openai_text_model,
         vision_model=openai_vision_model,
+        allowed_task_lists=(GOOGLE_SETTINGS.get("task_preset_lists") or []),
+        allowed_event_categories=list((GOOGLE_SETTINGS.get("category_colors") or {}).keys()),
     )
     PARSER = parser
     global ALLOWED_MODELS, CURRENT_MODEL, BASE_VISION_MODEL, CURRENT_VISION_MODEL, MODEL_STATE_PATH
@@ -595,7 +597,13 @@ def _initialize_assistant(calendar_client: GoogleCalendarClient) -> None:
     task_client = None
     try:
         task_list_id = GOOGLE_SETTINGS.get("task_list_id", "@default")
-        task_client = GoogleTaskClient(calendar_client.credentials, task_list_id=task_list_id)
+        preset_lists = GOOGLE_SETTINGS.get("task_preset_lists") or []
+        task_client = GoogleTaskClient(
+            calendar_client.credentials,
+            task_list_id=task_list_id,
+            preset_list_names=preset_lists,
+            max_lists=max(6, len(preset_lists)) or 6,
+        )
     except Exception as exc:
         logger.warning("Google Tasks 客户端初始化失败，将仅同步日历：%s", exc)
 

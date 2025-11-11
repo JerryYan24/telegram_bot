@@ -112,6 +112,8 @@ class TaskItem:
     due: Optional[datetime] = None
     timezone: str = "UTC"
     notes: str = ""
+    category: str = ""
+    list_name: str = ""
 
     def _resolve_timezone(self) -> ZoneInfo:
         try:
@@ -141,6 +143,10 @@ class TaskItem:
             parts.append(f"截止: {due_dt.strftime('%Y-%m-%d %H:%M')}")
         if self.notes:
             parts.append(f"备注: {self.notes}")
+        if self.category:
+            parts.append(f"分类: {self.category}")
+        if self.list_name:
+            parts.append(f"列表: {self.list_name}")
         return "\n".join(parts)
 
 
