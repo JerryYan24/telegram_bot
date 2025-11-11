@@ -35,6 +35,9 @@ pip install -r requirements.txt
 | `OPENAI_BASE_URL` | （可选）自定义 OpenAI endpoint，未设置则走官方 |
 | `OPENAI_TEXT_MODEL` | （可选）自定义文本模型，默认 `gpt-4o-mini` |
 | `OPENAI_VISION_MODEL` | （可选）图片解析模型，不填沿用文本模型 |
+| `OPENAI_ALLOWED_MODELS` | （可选）允许 `/model` 命令切换的模型列表，逗号或分号分隔 |
+| `OPENAI_MODEL_STATE_PATH` | （可选）记住上次选择的模型的保存路径，默认 `model_state.json` |
+| `OPENAI_ALLOWED_MODELS` | （可选）允许在 Telegram `/model` 命令中切换的模型列表，逗号分隔 |
 | `GOOGLE_CLIENT_SECRETS_PATH` | Google OAuth client secret JSON（必需） |
 | `GOOGLE_TOKEN_PATH` | OAuth token 保存路径（可选，默认 `google_token.json`） |
 | `GOOGLE_CALENDAR_ID` | 目标日历 ID，默认 `primary` |
@@ -53,6 +56,8 @@ openai:
   base_url: "https://api.openai.com/v1"   # 可替换成自建代理/兼容接口
   text_model: "gpt-4o-mini"
   vision_model: "gpt-4o-mini"
+  allowed_models: ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"]
+  model_state_path: "model_state.json"
 
 google:
   client_secrets_path: "/abs/path/client_secret.json"
@@ -111,6 +116,9 @@ cp config.example.yaml config.yaml
 
 如需自定义，把 `google.category_colors` 写成一个字典即可，键为小写分类名，值为 Google `colorId`（字符串 1-11，可用官方色名如 `peacock`/`red` 等）。还可以设置 `google.default_color_id`/`GOOGLE_DEFAULT_COLOR_ID` 作为兜底颜色；若想完全禁用默认映射，可在配置里写 `category_colors: {}`。
 
+### 切换解析模型
+如果你在 `openai.allowed_models`（或 `OPENAI_ALLOWED_MODELS`）里列出了多个模型，可以在 Telegram 里发送 `/model` 查看当前模型和可选列表，再点击按钮或输入 `/model gpt-4o` 之类的命令即时切换。默认情况下会把文本与视觉解析模型一起切换；若在配置里显式设置了 `openai.vision_model`，则图像解析始终使用该模型。最近一次选择会写入 `openai.model_state_path`（默认 `model_state.json`），下次启动自动沿用。
+
 ## 邮箱轮询（可选）
 启用邮件转日历需额外配置：
 
@@ -130,7 +138,7 @@ cp config.example.yaml config.yaml
 python jarvis.py
 ```
 
-> 首次启动若尚未授权 Google Calendar，请在 Telegram 中发送 `/google_auth` 按提示完成登录，再把页面展示的 code 粘贴给机器人（或使用 `/google_auth_code <code>`）。完成一次后会自动复用本地 `google_token.json`。
+> 首次启动若尚未授权 Google Calendar，请在 Telegram 中发送 `/google_auth` 按提示完成登录，再把页面展示的 code 粘贴给机器人（或使用 `/google_auth_code <code>`）。完成一次后会自动复用本地 `google_token.json`。要切换解析模型，可在对话中发送 `/model` 查看选项并实时更换。
 
 启动后你可以：
 1. 在 Telegram 里发送一句自然语言描述（如“明天上午9点和 Alex 开周会”）。

@@ -1,11 +1,12 @@
 import asyncio
+import json
 import logging
 import os
 import tempfile
 from datetime import datetime, timezone, timedelta
 from functools import partial
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from google.oauth2.credentials import Credentials
@@ -48,6 +49,11 @@ GOOGLE_SETTINGS: Dict[str, object] = {}
 EMAIL_SETTINGS: Dict[str, object] = {}
 PENDING_OAUTH_FLOWS: Dict[int, Dict[str, object]] = {}
 OOB_REDIRECT_URI = "urn:ietf:wg:oauth:2.0:oob"
+ALLOWED_MODELS: List[str] = []
+CURRENT_MODEL: str = ""
+BASE_VISION_MODEL: Optional[str] = None
+CURRENT_VISION_MODEL: str = ""
+MODEL_STATE_PATH: str = "model_state.json"
 
 
 def bootstrap() -> None:
@@ -84,6 +90,19 @@ def bootstrap() -> None:
     if not isinstance(category_colors, dict):
         category_colors = None
     default_color_id = get_config_value(CONFIG, "google.default_color_id", "GOOGLE_DEFAULT_COLOR_ID")
+    allowed_models_raw = get_config_value(
+        CONFIG,
+        "openai.allowed_models",
+        "OPENAI_ALLOWED_MODELS",
+        default=None,
+        cast=lambda value: value,
+    )
+    model_state_path = get_config_value(
+        CONFIG,
+        "openai.model_state_path",
+        "OPENAI_MODEL_STATE_PATH",
+        "model_state.json",
+    )
 
     required = {
         "TELEGRAM_BOT_TOKEN/telegram.bot_token": TELEGRAM_TOKEN,
@@ -102,6 +121,17 @@ def bootstrap() -> None:
         vision_model=openai_vision_model,
     )
     PARSER = parser
+    global ALLOWED_MODELS, CURRENT_MODEL, BASE_VISION_MODEL, CURRENT_VISION_MODEL, MODEL_STATE_PATH
+    ALLOWED_MODELS = _normalize_allowed_models(
+        allowed_models_raw,
+        default_text=openai_text_model,
+        default_vision=openai_vision_model or openai_text_model,
+    )
+    CURRENT_MODEL = openai_text_model
+    BASE_VISION_MODEL = openai_vision_model
+    CURRENT_VISION_MODEL = openai_vision_model or openai_text_model
+    MODEL_STATE_PATH = model_state_path
+    _load_model_state()
     GOOGLE_SETTINGS = {
         "client_secrets_path": google_client_secrets_path,
         "token_path": google_token_path,
@@ -159,6 +189,30 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "随时发送活动描述、转发邮件或分享图片，我会把其中的事件同步到你的 Google Calendar。"
     )
+
+
+async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not PARSER:
+        await update.message.reply_text("助手尚未初始化，无法切换模型。")
+        return
+    if not ALLOWED_MODELS:
+        await update.message.reply_text("当前没有配置可切换的模型。")
+        return
+    if context.args:
+        target = context.args[0].strip()
+        message = _handle_model_switch(target)
+        await update.message.reply_text(message)
+        return
+
+    keyboard = _build_model_keyboard()
+    allowed_str = ", ".join(ALLOWED_MODELS)
+    message = (
+        f"当前文本模型: {CURRENT_MODEL}\n"
+        f"当前视觉模型: {CURRENT_VISION_MODEL}\n"
+        f"可选模型: {allowed_str}\n\n"
+        "直接点击下方按钮或输入 `/model 模型名` 即可切换。"
+    )
+    await update.message.reply_text(message, reply_markup=keyboard)
 
 
 async def google_auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -318,6 +372,22 @@ async def cancel_google_auth(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await context.bot.send_message(chat_id, "已取消本次 Google 授权请求。")
 
 
+async def model_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    data = query.data or ""
+    if not data.startswith("model_select:"):
+        return
+    target = data.split("model_select:", 1)[1]
+    message = _handle_model_switch(target)
+    try:
+        await query.edit_message_text(message, reply_markup=_build_model_keyboard())
+    except Exception:
+        await query.message.reply_text(message)
+
+
 def _flow_owner_id(update: Update) -> Optional[int]:
     user = update.effective_user
     if user and user.id:
@@ -334,6 +404,93 @@ def _persist_credentials(creds: Credentials) -> None:
     token_file.parent.mkdir(parents=True, exist_ok=True)
     token_file.write_text(creds.to_json())
     logger.info("Saved Google OAuth token to %s", token_file)
+
+
+def _handle_model_switch(target: str) -> str:
+    global CURRENT_MODEL, CURRENT_VISION_MODEL
+    normalized = _match_allowed_model(target)
+    if not normalized:
+        allowed_str = ", ".join(ALLOWED_MODELS)
+        return f"未知模型: {target}。可选项：{allowed_str}"
+    if normalized == CURRENT_MODEL:
+        return f"当前已使用模型 {normalized}。"
+    vision_model = BASE_VISION_MODEL or normalized
+    CURRENT_MODEL = normalized
+    CURRENT_VISION_MODEL = vision_model
+    _apply_current_model_to_parser()
+    _persist_model_state()
+    return f"解析模型已切换为 {normalized}。"
+
+
+def _build_model_keyboard() -> Optional[InlineKeyboardMarkup]:
+    if not ALLOWED_MODELS:
+        return None
+    buttons = []
+    for model in ALLOWED_MODELS:
+        label = f"✅ {model}" if model == CURRENT_MODEL else model
+        buttons.append(InlineKeyboardButton(label, callback_data=f"model_select:{model}"))
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    return InlineKeyboardMarkup(rows)
+
+
+def _match_allowed_model(target: str) -> Optional[str]:
+    if not target:
+        return None
+    lowered = target.lower()
+    for candidate in ALLOWED_MODELS:
+        if candidate.lower() == lowered:
+            return candidate
+    return None
+
+
+def _persist_model_state() -> None:
+    if not MODEL_STATE_PATH:
+        return
+    path = Path(MODEL_STATE_PATH).expanduser()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        pass
+    data = {
+        "text_model": CURRENT_MODEL,
+        "vision_model": CURRENT_VISION_MODEL,
+    }
+    try:
+        path.write_text(json.dumps(data))
+    except Exception as exc:
+        logger.warning("Failed to persist model state: %s", exc)
+
+
+def _load_model_state() -> None:
+    if not MODEL_STATE_PATH:
+        return
+    path = Path(MODEL_STATE_PATH).expanduser()
+    if not path.exists():
+        _apply_current_model_to_parser()
+        return
+    try:
+        data = json.loads(path.read_text() or "{}")
+    except Exception as exc:
+        logger.warning("Failed to read model state file %s: %s", path, exc)
+        _apply_current_model_to_parser()
+        return
+    text_model = data.get("text_model")
+    vision_model = data.get("vision_model")
+    matched_model = _match_allowed_model(text_model) if text_model else None
+    if matched_model:
+        global CURRENT_MODEL, CURRENT_VISION_MODEL
+        CURRENT_MODEL = matched_model
+        if BASE_VISION_MODEL:
+            CURRENT_VISION_MODEL = BASE_VISION_MODEL
+        else:
+            CURRENT_VISION_MODEL = vision_model or matched_model
+    _apply_current_model_to_parser()
+
+
+def _apply_current_model_to_parser() -> None:
+    if PARSER:
+        vision_model = BASE_VISION_MODEL or CURRENT_VISION_MODEL or CURRENT_MODEL
+        PARSER.update_models(text_model=CURRENT_MODEL, vision_model=vision_model)
 
 
 async def _process_oauth_code(
@@ -473,9 +630,11 @@ def main():
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("model", model_command))
     application.add_handler(CommandHandler("google_auth", google_auth_command))
     application.add_handler(CommandHandler("google_auth_code", google_auth_code_command))
     application.add_handler(CallbackQueryHandler(cancel_google_auth, pattern="^cancel_oauth$"))
+    application.add_handler(CallbackQueryHandler(model_selection_callback, pattern="^model_select:"))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
@@ -492,6 +651,32 @@ def _current_time_strings() -> Tuple[str, str]:
     local_now = now_utc.astimezone(tz)
     local_str = local_now.strftime("%Y-%m-%d %H:%M (%Z)")
     return local_str, now_utc.isoformat()
+
+
+def _normalize_allowed_models(value, default_text: Optional[str], default_vision: Optional[str]) -> List[str]:
+    models: List[str] = []
+    if isinstance(value, str):
+        raw_items = value.replace(";", ",").split(",")
+        models = [item.strip() for item in raw_items if item.strip()]
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            if not item:
+                continue
+            models.append(str(item).strip())
+    else:
+        models = []
+    defaults = [default_text, default_vision]
+    for item in defaults:
+        if item:
+            models.append(item)
+    seen = set()
+    unique_models = []
+    for model in models:
+        if not model or model in seen:
+            continue
+        seen.add(model)
+        unique_models.append(model)
+    return unique_models
 
 
 if __name__ == "__main__":

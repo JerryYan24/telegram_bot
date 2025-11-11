@@ -56,6 +56,12 @@ class OpenAIEventParser:
         self.client = OpenAI(**client_kwargs)
         self.logger = logging.getLogger(self.__class__.__name__)
 
+    def update_models(self, text_model: Optional[str] = None, vision_model: Optional[str] = None) -> None:
+        if text_model:
+            self.text_model = text_model
+        if vision_model:
+            self.vision_model = vision_model
+
     def parse_text(self, text: str, context: Optional[Dict[str, str]] = None) -> List[CalendarEvent]:
         payload = self._run_completion(
             model=self.text_model,
