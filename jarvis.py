@@ -4,8 +4,12 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from functools import partial
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
 
 from telegram import Update
 from telegram.ext import (
@@ -22,6 +26,7 @@ from smart_assistant import (
     GoogleCalendarClient,
     OpenAIEventParser,
 )
+from smart_assistant.calendar_client import SCOPES
 from smart_assistant.config import get_config_value, load_config
 from smart_assistant.models import AssistantResult
 
@@ -37,10 +42,15 @@ EMAIL_INGESTOR: Optional[EmailEventIngestor] = None
 TELEGRAM_TOKEN: Optional[str] = None
 CONFIG: Dict[str, object] = {}
 DEFAULT_TIMEZONE: str = "UTC"
+PARSER: Optional[OpenAIEventParser] = None
+GOOGLE_SETTINGS: Dict[str, object] = {}
+EMAIL_SETTINGS: Dict[str, object] = {}
+PENDING_OAUTH_FLOWS: Dict[int, InstalledAppFlow] = {}
+OOB_REDIRECT_URI = "urn:ietf:wg:oauth:2.0:oob"
 
 
 def bootstrap() -> None:
-    global ASSISTANT, EMAIL_INGESTOR, TELEGRAM_TOKEN, CONFIG, DEFAULT_TIMEZONE
+    global ASSISTANT, EMAIL_INGESTOR, TELEGRAM_TOKEN, CONFIG, DEFAULT_TIMEZONE, PARSER, GOOGLE_SETTINGS, EMAIL_SETTINGS
 
     config_path = os.getenv("ASSISTANT_CONFIG_PATH")
     CONFIG = load_config(config_path)
@@ -90,43 +100,47 @@ def bootstrap() -> None:
         text_model=openai_text_model,
         vision_model=openai_vision_model,
     )
-    calendar_client = GoogleCalendarClient(
-        calendar_id=calendar_id,
-        client_secrets_path=google_client_secrets_path,
-        token_path=google_token_path,
-    )
-    ASSISTANT = CalendarAutomationAssistant(
-        parser,
-        calendar_client,
-        category_colors=category_colors,
-        default_color_id=default_color_id,
-    )
+    PARSER = parser
+    GOOGLE_SETTINGS = {
+        "client_secrets_path": google_client_secrets_path,
+        "token_path": google_token_path,
+        "calendar_id": calendar_id,
+        "category_colors": category_colors,
+        "default_color_id": default_color_id,
+    }
 
     imap_host = get_config_value(CONFIG, "email.imap_host", "ASSISTANT_IMAP_HOST")
     imap_user = get_config_value(CONFIG, "email.username", "ASSISTANT_EMAIL")
     imap_password = get_config_value(CONFIG, "email.password", "ASSISTANT_EMAIL_PASSWORD")
+    poll_interval_raw = get_config_value(CONFIG, "email.poll_interval", "ASSISTANT_EMAIL_POLL_INTERVAL", 60)
+    folder = get_config_value(CONFIG, "email.folder", "ASSISTANT_IMAP_FOLDER", "INBOX")
+    use_ssl_raw = get_config_value(CONFIG, "email.use_ssl", "ASSISTANT_IMAP_SSL", True)
+    EMAIL_SETTINGS = {
+        "host": imap_host or "",
+        "username": imap_user or "",
+        "password": imap_password or "",
+        "folder": folder,
+        "use_ssl": str(use_ssl_raw).lower() != "false",
+        "poll_interval": int(poll_interval_raw),
+    }
+    if not imap_host or not imap_user or not imap_password:
+        logger.info("Email ingestion disabled. 在 config.yaml 中填写 email.* 或 ASSISTANT_IMAP_* 以启用。")
 
-    if imap_host and imap_user and imap_password:
-        poll_interval_raw = get_config_value(
-            CONFIG, "email.poll_interval", "ASSISTANT_EMAIL_POLL_INTERVAL", 60
+    calendar_client = None
+    try:
+        calendar_client = GoogleCalendarClient(
+            calendar_id=calendar_id,
+            client_secrets_path=google_client_secrets_path,
+            token_path=google_token_path,
+            allow_interactive=False,
         )
-        folder = get_config_value(CONFIG, "email.folder", "ASSISTANT_IMAP_FOLDER", "INBOX")
-        use_ssl_raw = get_config_value(CONFIG, "email.use_ssl", "ASSISTANT_IMAP_SSL", True)
-        poll_interval = int(poll_interval_raw)
-        use_ssl = str(use_ssl_raw).lower() != "false"
-        EMAIL_INGESTOR = EmailEventIngestor(
-            host=imap_host,
-            username=imap_user,
-            password=imap_password,
-            assistant=ASSISTANT,
-            folder=folder,
-            use_ssl=use_ssl,
-            poll_interval=poll_interval,
+    except Exception as exc:
+        logger.warning(
+            "Google OAuth token 未就绪：%s。请在 Telegram 中发送 /google_auth 完成授权。", exc
         )
-        EMAIL_INGESTOR.start()
-        logger.info("Email ingestion enabled for %s", imap_user)
-    else:
-        logger.warning("Email ingestion disabled. 在 config.yaml 或环境变量中设置 ASSISTANT_IMAP_* 以启用。")
+
+    if calendar_client:
+        _initialize_assistant(calendar_client)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -146,9 +160,93 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def google_auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_key = _flow_owner_id(update)
+    if user_key is None:
+        await update.message.reply_text("无法识别用户，请在私聊或群组中直接使用 /google_auth。")
+        return
+    client_secrets_path = GOOGLE_SETTINGS.get("client_secrets_path")
+    if not client_secrets_path:
+        await update.message.reply_text("缺少 google.client_secrets_path，请先在 config.yaml 中配置。")
+        return
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file(client_secrets_path, SCOPES)
+        flow.redirect_uri = OOB_REDIRECT_URI
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            prompt="consent",
+            include_granted_scopes="true",
+        )
+    except Exception as exc:
+        logger.exception("Failed to create OAuth flow")
+        await update.message.reply_text(f"生成授权链接失败：{exc}")
+        return
+
+    PENDING_OAUTH_FLOWS[user_key] = flow
+    await update.message.reply_text(
+        "请打开以下链接完成 Google 授权：\n\n"
+        f"{auth_url}\n\n"
+        "授权完成后，Google 页面会显示一段 code。复制该 code 后发送命令：\n"
+        "/google_auth_code <code>\n\n"
+        "如果需要重新开始，可再次发送 /google_auth。"
+    )
+
+
+async def google_auth_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_key = _flow_owner_id(update)
+    if user_key is None:
+        await update.message.reply_text("无法识别用户，请在私聊或群组中直接使用 /google_auth_code。")
+        return
+    flow = PENDING_OAUTH_FLOWS.get(user_key)
+    if not flow:
+        await update.message.reply_text("没有待处理的授权请求，请先发送 /google_auth 获取链接。")
+        return
+    if not context.args:
+        await update.message.reply_text("请在命令后附上 Google 页面显示的 code。")
+        return
+
+    raw_code = " ".join(context.args).strip()
+    code = GoogleCalendarClient._extract_code(raw_code)
+    if not code:
+        await update.message.reply_text("未检测到有效的 code，请直接粘贴 Google 页面显示的字符串。")
+        return
+
+    try:
+        flow.fetch_token(code=code)
+    except Exception as exc:
+        logger.exception("Failed to exchange OAuth code")
+        PENDING_OAUTH_FLOWS.pop(user_key, None)
+        await update.message.reply_text(f"换取 token 失败：{exc}\n请重新发送 /google_auth 再试。")
+        return
+
+    creds = flow.credentials
+    PENDING_OAUTH_FLOWS.pop(user_key, None)
+    try:
+        _persist_credentials(creds)
+    except Exception as exc:
+        logger.exception("Failed to persist OAuth token")
+        await update.message.reply_text(f"保存 token 失败：{exc}")
+        return
+
+    try:
+        calendar_client = GoogleCalendarClient(
+            calendar_id=GOOGLE_SETTINGS.get("calendar_id", "primary"),
+            client_secrets_path=GOOGLE_SETTINGS.get("client_secrets_path"),
+            token_path=GOOGLE_SETTINGS.get("token_path", "google_token.json"),
+            credentials=creds,
+        )
+    except Exception as exc:
+        logger.exception("Failed to build Google Calendar client after OAuth")
+        await update.message.reply_text(f"初始化 Google Calendar 失败：{exc}")
+        return
+
+    _initialize_assistant(calendar_client)
+    await update.message.reply_text("Google 授权成功，现在可以开始创建日程了！")
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ASSISTANT:
-        await update.message.reply_text("助手尚未初始化。")
+        await update.message.reply_text("助手尚未初始化，请先发送 /google_auth 完成授权。")
         return
     text = update.message.text or ""
     metadata = build_metadata(update, source="telegram-text")
@@ -158,7 +256,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ASSISTANT:
-        await update.message.reply_text("助手尚未初始化。")
+        await update.message.reply_text("助手尚未初始化，请先发送 /google_auth 完成授权。")
         return
     if not update.message.photo:
         await update.message.reply_text("没有检测到可用的图片。")
@@ -210,6 +308,72 @@ async def reply_with_result(update: Update, result: AssistantResult):
     await update.message.reply_text(message)
 
 
+def _flow_owner_id(update: Update) -> Optional[int]:
+    user = update.effective_user
+    if user and user.id:
+        return user.id
+    chat = update.effective_chat
+    if chat and chat.id:
+        return chat.id
+    return None
+
+
+def _persist_credentials(creds: Credentials) -> None:
+    token_path = GOOGLE_SETTINGS.get("token_path") or "google_token.json"
+    token_file = Path(token_path).expanduser()
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    token_file.write_text(creds.to_json())
+    logger.info("Saved Google OAuth token to %s", token_file)
+
+
+def _initialize_assistant(calendar_client: GoogleCalendarClient) -> None:
+    global ASSISTANT
+    if not PARSER:
+        raise RuntimeError("OpenAI 事件解析器尚未初始化。")
+    ASSISTANT = CalendarAutomationAssistant(
+        PARSER,
+        calendar_client,
+        category_colors=GOOGLE_SETTINGS.get("category_colors"),
+        default_color_id=GOOGLE_SETTINGS.get("default_color_id"),
+    )
+    _ensure_email_ingestor()
+    logger.info("Google Calendar 凭证已就绪，助手完成初始化。")
+
+
+def _ensure_email_ingestor() -> None:
+    global EMAIL_INGESTOR
+    host = EMAIL_SETTINGS.get("host")
+    username = EMAIL_SETTINGS.get("username")
+    password = EMAIL_SETTINGS.get("password")
+    if not host or not username or not password:
+        _stop_email_ingestor()
+        return
+    if not ASSISTANT:
+        _stop_email_ingestor()
+        return
+    if EMAIL_INGESTOR:
+        EMAIL_INGESTOR.assistant = ASSISTANT
+        return
+    EMAIL_INGESTOR = EmailEventIngestor(
+        host=host,
+        username=username,
+        password=password,
+        assistant=ASSISTANT,
+        folder=EMAIL_SETTINGS.get("folder", "INBOX"),
+        use_ssl=bool(EMAIL_SETTINGS.get("use_ssl", True)),
+        poll_interval=int(EMAIL_SETTINGS.get("poll_interval", 60)),
+    )
+    EMAIL_INGESTOR.start()
+    logger.info("Email ingestion enabled for %s", username)
+
+
+def _stop_email_ingestor() -> None:
+    global EMAIL_INGESTOR
+    if EMAIL_INGESTOR:
+        EMAIL_INGESTOR.stop()
+        EMAIL_INGESTOR = None
+
+
 async def run_in_executor(func, *args):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, partial(func, *args))
@@ -217,12 +381,16 @@ async def run_in_executor(func, *args):
 
 def main():
     bootstrap()
-    if not TELEGRAM_TOKEN or not ASSISTANT:
-        raise RuntimeError("助手初始化失败。")
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("缺少 TELEGRAM_BOT_TOKEN。")
+    if not ASSISTANT:
+        logger.warning("助手尚未完成 Google 授权，发送 /google_auth 以继续。")
 
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("google_auth", google_auth_command))
+    application.add_handler(CommandHandler("google_auth_code", google_auth_code_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 

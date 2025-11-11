@@ -20,12 +20,19 @@ class GoogleCalendarClient:
         calendar_id: str = "primary",
         client_secrets_path: Optional[str] = None,
         token_path: str = "google_token.json",
+        *,
+        credentials: Optional[Credentials] = None,
+        allow_interactive: bool = True,
     ):
         self.logger = logging.getLogger(self.__class__.__name__)
-        if not client_secrets_path:
-            raise ValueError("OAuth 模式需要提供 google.client_secrets_path")
-        credentials = self._load_user_credentials(client_secrets_path, token_path)
-        self.service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
+        if credentials is None:
+            if not client_secrets_path:
+                raise ValueError("OAuth 模式需要提供 google.client_secrets_path")
+            credentials = self._load_user_credentials(
+                client_secrets_path, token_path, allow_interactive=allow_interactive
+            )
+        self.credentials = credentials
+        self.service = build("calendar", "v3", credentials=self.credentials, cache_discovery=False)
         self.calendar_id = calendar_id
 
     def create_event(self, event: CalendarEvent) -> str:
@@ -43,7 +50,9 @@ class GoogleCalendarClient:
             self.logger.exception("Google Calendar API error: %s", exc)
             raise CalendarSyncError(exc) from exc
 
-    def _load_user_credentials(self, client_secrets_path: str, token_path: str) -> Credentials:
+    def _load_user_credentials(
+        self, client_secrets_path: str, token_path: str, allow_interactive: bool = True
+    ) -> Credentials:
         token_file = Path(token_path).expanduser()
         creds: Optional[Credentials] = None
 
@@ -54,6 +63,10 @@ class GoogleCalendarClient:
             creds.refresh(Request())
 
         if not creds or not creds.valid:
+            if not allow_interactive:
+                raise RuntimeError(
+                    "未找到可用的 Google OAuth token。请先运行 /google_auth，在 Telegram 中完成授权后再重试。"
+                )
             flow = InstalledAppFlow.from_client_secrets_file(client_secrets_path, SCOPES)
             try:
                 creds = flow.run_local_server(port=0, prompt="consent")
