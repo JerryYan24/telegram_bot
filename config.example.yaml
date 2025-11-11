@@ -1,0 +1,29 @@
+telegram:
+  bot_token: "123456789:ABCDEF"
+
+openai:
+  api_key: "sk-your-key"
+  base_url: "https://api.openai.com/v1"
+  text_model: "gpt-4o-mini"
+  vision_model: ""
+
+google:
+  client_secrets_path: "/absolute/path/to/client_secret.json"
+  token_path: "google_token.json"
+  calendar_id: "primary"
+  category_colors:
+    work: "7"
+    personal: "5"
+    travel: "9"
+  default_color_id: ""
+
+assistant:
+  default_tz: "Asia/Shanghai"
+
+email:
+  imap_host: "imap.example.com"
+  username: "bot@example.com"
+  password: "app-password"
+  folder: "INBOX"
+  poll_interval: 60
+  use_ssl: true

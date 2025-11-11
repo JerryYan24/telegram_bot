@@ -47,3 +47,11 @@ config.ini
 # System files
 .DS_Store
 Thumbs.db 
+
+# Assistant secrets & tokens
+config.yaml
+google_token.json
+google_oauth_calendar.json
+google_*.json
+*_token.json
+*_secret*.json
