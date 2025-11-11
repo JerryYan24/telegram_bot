@@ -123,6 +123,7 @@ def bootstrap() -> None:
     persona_text = None
     global PERSONA_FILE_PATH
     PERSONA_FILE_PATH = persona_file
+    usage_path = assistant_cfg.get("usage_path")
     if persona_file:
         try:
             with open(persona_file, "r", encoding="utf-8") as f:
@@ -142,6 +143,7 @@ def bootstrap() -> None:
         allowed_task_lists=(GOOGLE_SETTINGS.get("task_preset_lists") or []),
         allowed_event_categories=list((GOOGLE_SETTINGS.get("category_colors") or {}).keys()),
         persona_text=persona_text,
+        usage_path=usage_path,
     )
     PARSER = parser
     global ALLOWED_MODELS, CURRENT_MODEL, BASE_VISION_MODEL, CURRENT_VISION_MODEL, MODEL_STATE_PATH
@@ -226,6 +228,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "随时发送活动描述、转发邮件或分享图片，我会把其中的事件同步到你的 Google Calendar。"
     )
+
+async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not PARSER:
+        await update.message.reply_text("助手尚未初始化，无法查询用量。")
+        return
+    lines = PARSER.get_usage_summary_lines()
+    await update.message.reply_text("模型用量（tokens）:\n" + "\n".join(lines))
 
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -732,6 +741,7 @@ def main():
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CommandHandler("model", model_command))
     application.add_handler(CommandHandler("add_info", add_info_command))
     application.add_handler(CommandHandler("google_auth", google_auth_command))

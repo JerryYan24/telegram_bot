@@ -33,6 +33,7 @@ google:
 assistant:
   default_tz: "Asia/Shanghai"
   persona_file: ""  # e.g. "assistant_persona.md"
+  usage_path: "usage_stats.json"
 
 email:
   imap_host: "imap.example.com"

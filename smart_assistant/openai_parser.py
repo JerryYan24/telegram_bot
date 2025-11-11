@@ -69,6 +69,7 @@ class OpenAIEventParser:
         allowed_task_lists: Optional[List[str]] = None,
         allowed_event_categories: Optional[List[str]] = None,
         persona_text: Optional[str] = None,
+        usage_path: Optional[str] = None,
     ):
         self.default_timezone = default_timezone
         self.text_model = text_model
@@ -76,6 +77,27 @@ class OpenAIEventParser:
         self.allowed_task_lists = [s.strip() for s in (allowed_task_lists or []) if str(s).strip()]
         self.allowed_event_categories = [s.strip() for s in (allowed_event_categories or []) if str(s).strip()]
         self.persona_text = (persona_text or "").strip()
+        # Usage tracking per model
+        self.usage_by_model: Dict[str, Dict[str, int]] = {}
+        self.usage_path = usage_path or ""
+        if self.usage_path and os.path.exists(self.usage_path):
+            try:
+                with open(self.usage_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        # Normalize ints
+                        norm: Dict[str, Dict[str, int]] = {}
+                        for model_name, stats in data.items():
+                            if not isinstance(stats, dict):
+                                continue
+                            norm[model_name] = {
+                                "prompt": int(stats.get("prompt", 0)),
+                                "completion": int(stats.get("completion", 0)),
+                                "total": int(stats.get("total", 0)),
+                            }
+                        self.usage_by_model = norm
+            except Exception:
+                self.usage_by_model = {}
         client_kwargs = {"api_key": api_key}
         if base_url:
             client_kwargs["base_url"] = base_url
@@ -126,6 +148,17 @@ class OpenAIEventParser:
                 {"role": "user", "content": user_content},
             ],
         )
+        # Update token usage counters if available
+        try:
+            prompt_toks, completion_toks, total_toks = self._extract_usage(response)
+            if prompt_toks or completion_toks or total_toks:
+                bucket = self.usage_by_model.setdefault(model, {"prompt": 0, "completion": 0, "total": 0})
+                bucket["prompt"] += prompt_toks
+                bucket["completion"] += completion_toks
+                bucket["total"] += (total_toks or (prompt_toks + completion_toks))
+                self._persist_usage()
+        except Exception:
+            pass
         text = self._response_to_text(response)
         return self._extract_json(text)
 
@@ -239,6 +272,58 @@ class OpenAIEventParser:
 
         # Nothing found; return empty string to let caller handle
         return ""
+
+    def _extract_usage(self, response) -> tuple[int, int, int]:
+        """Return (prompt_tokens, completion_tokens, total_tokens) if present; else zeros."""
+        # SDK attribute style
+        usage = getattr(response, "usage", None)
+        if usage:
+            prompt = getattr(usage, "input_tokens", None) or getattr(usage, "prompt_tokens", None) or 0
+            completion = getattr(usage, "output_tokens", None) or getattr(usage, "completion_tokens", None) or 0
+            total = getattr(usage, "total_tokens", None) or (prompt + completion)
+            return int(prompt or 0), int(completion or 0), int(total or 0)
+        # Chat-style choices usage
+        choices = getattr(response, "choices", None)
+        if choices:
+            try:
+                first = choices[0]
+                ch_usage = getattr(first, "usage", None)
+                if ch_usage:
+                    prompt = getattr(ch_usage, "prompt_tokens", 0) or 0
+                    completion = getattr(ch_usage, "completion_tokens", 0) or 0
+                    total = getattr(ch_usage, "total_tokens", 0) or (prompt + completion)
+                    return int(prompt), int(completion), int(total)
+            except Exception:
+                pass
+        # Dict fallback
+        if isinstance(response, dict):
+            u = response.get("usage") or {}
+            prompt = u.get("input_tokens") or u.get("prompt_tokens") or 0
+            completion = u.get("output_tokens") or u.get("completion_tokens") or 0
+            total = u.get("total_tokens") or (prompt + completion)
+            return int(prompt or 0), int(completion or 0), int(total or 0)
+        return 0, 0, 0
+
+    def get_usage_summary_lines(self) -> List[str]:
+        if not self.usage_by_model:
+            return ["暂无用量数据。"]
+        lines: List[str] = []
+        for model_name in sorted(self.usage_by_model.keys()):
+            stats = self.usage_by_model.get(model_name, {})
+            lines.append(
+                f"{model_name}: prompt={int(stats.get('prompt', 0))}, completion={int(stats.get('completion', 0))}, total={int(stats.get('total', 0))}"
+            )
+        return lines
+
+    def _persist_usage(self) -> None:
+        if not self.usage_path:
+            return
+        try:
+            payload = self.usage_by_model
+            with open(self.usage_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+        except Exception:
+            pass
 
     def _extract_json(self, raw_text: str):
         normalized = self._strip_code_fences(raw_text)
