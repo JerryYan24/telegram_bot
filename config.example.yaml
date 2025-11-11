@@ -32,6 +32,7 @@ google:
 
 assistant:
   default_tz: "Asia/Shanghai"
+  persona_file: ""  # e.g. "assistant_persona.md"
 
 email:
   imap_host: "imap.example.com"

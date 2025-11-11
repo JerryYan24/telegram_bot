@@ -41,6 +41,21 @@ Always try to set category; use "other" only when unsure. Keep titles short but 
 Never fabricate URLs, meeting links, QR codes, or map locations—only include them when the user explicitly shares them.
 """
 
+PERSONA_EDIT_PROMPT = """
+You are helping maintain a concise persona/preferences document for a single user.
+Given the current markdown and a new user message, update the markdown to reflect stable, reusable preferences.
+Rules:
+- Keep it short, structured, and deduplicated.
+- Prefer adding or refining existing bullets over long prose.
+- Only include enduring preferences (not one-off requests).
+- Output FINAL markdown only, no explanations, no code fences.
+
+CURRENT MARKDOWN:
+{current_md}
+
+NEW MESSAGE:
+{new_message}
+"""
 
 
 class OpenAIEventParser:
@@ -53,12 +68,14 @@ class OpenAIEventParser:
         base_url: Optional[str] = None,
         allowed_task_lists: Optional[List[str]] = None,
         allowed_event_categories: Optional[List[str]] = None,
+        persona_text: Optional[str] = None,
     ):
         self.default_timezone = default_timezone
         self.text_model = text_model
         self.vision_model = vision_model or text_model
         self.allowed_task_lists = [s.strip() for s in (allowed_task_lists or []) if str(s).strip()]
         self.allowed_event_categories = [s.strip() for s in (allowed_event_categories or []) if str(s).strip()]
+        self.persona_text = (persona_text or "").strip()
         client_kwargs = {"api_key": api_key}
         if base_url:
             client_kwargs["base_url"] = base_url
@@ -115,6 +132,8 @@ class OpenAIEventParser:
     def _build_system_prompt(self) -> str:
         prompt = PROMPT_TEMPLATE.format(default_timezone=self.default_timezone)
         guidance_parts: List[str] = []
+        if self.persona_text:
+            guidance_parts.append(f"User preferences and persona: {self.persona_text}")
         if self.allowed_event_categories:
             cats_str = ", ".join(f'"{name}"' for name in self.allowed_event_categories)
             guidance_parts.append(
@@ -128,6 +147,23 @@ class OpenAIEventParser:
         if guidance_parts:
             prompt = prompt + "\n" + " ".join(guidance_parts)
         return prompt
+
+    def refine_persona_markdown(self, current_markdown: str, user_message: str) -> str:
+        """Return updated persona markdown based on user_message."""
+        system_prompt = "You edit the user's persistent persona/preferences document."
+        user_content = PERSONA_EDIT_PROMPT.format(
+            current_md=current_markdown or "(empty)",
+            new_message=user_message.strip(),
+        )
+        response = self.client.responses.create(
+            model=self.text_model,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": [{"type": "input_text", "text": user_content}]},
+            ],
+        )
+        text = self._response_to_text(response)
+        return (text or "").strip()
 
     def _response_to_text(self, response) -> str:
         # 1) Prefer unified field if present (some providers expose output_text)

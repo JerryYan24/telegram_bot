@@ -55,6 +55,8 @@ CURRENT_MODEL: str = ""
 BASE_VISION_MODEL: Optional[str] = None
 CURRENT_VISION_MODEL: str = ""
 MODEL_STATE_PATH: str = "model_state.json"
+PERSONA_FILE_PATH: Optional[str] = None
+EDIT_PERSONA_CHATS: set[int] = set()
 
 
 def bootstrap() -> None:
@@ -115,6 +117,22 @@ def bootstrap() -> None:
     if missing:
         raise RuntimeError(f"缺少必要配置: {', '.join(missing)}")
 
+    # Load persona: prefer external file if provided; fallback to inline notes
+    assistant_cfg = (CONFIG.get("assistant", {}) or {})
+    persona_file = assistant_cfg.get("persona_file")
+    persona_text = None
+    global PERSONA_FILE_PATH
+    PERSONA_FILE_PATH = persona_file
+    if persona_file:
+        try:
+            with open(persona_file, "r", encoding="utf-8") as f:
+                file_notes = f.read().strip()
+                if file_notes:
+                    persona_text = file_notes
+        except Exception:
+            # ignore file load errors; fallback to inline notes
+            pass
+
     parser = OpenAIEventParser(
         api_key=openai_key,
         default_timezone=default_timezone,
@@ -123,6 +141,7 @@ def bootstrap() -> None:
         vision_model=openai_vision_model,
         allowed_task_lists=(GOOGLE_SETTINGS.get("task_preset_lists") or []),
         allowed_event_categories=list((GOOGLE_SETTINGS.get("category_colors") or {}).keys()),
+        persona_text=persona_text,
     )
     PARSER = parser
     global ALLOWED_MODELS, CURRENT_MODEL, BASE_VISION_MODEL, CURRENT_VISION_MODEL, MODEL_STATE_PATH
@@ -187,6 +206,19 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2. 在 Telegram 发文字或语音转文字描述日程。\n"
         "3. 上传会议/活动海报照片，我能读图识别时间地点。\n"
         "请告诉我你想安排的事情吧！"
+    )
+
+async def add_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None:
+        return
+    EDIT_PERSONA_CHATS.add(chat_id)
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("退出编辑模式", callback_data="exit_persona_mode")]]
+    )
+    await update.message.reply_text(
+        "已进入偏好编辑模式。发送消息来完善你的偏好；完成后点击下方按钮退出。",
+        reply_markup=keyboard,
     )
 
 
@@ -282,6 +314,29 @@ async def google_auth_code_command(update: Update, context: ContextTypes.DEFAULT
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Persona edit mode first
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id in EDIT_PERSONA_CHATS and PARSER and PERSONA_FILE_PATH:
+        raw_text = (update.message.text or "").strip()
+        if raw_text:
+            try:
+                try:
+                    with open(PERSONA_FILE_PATH, "r", encoding="utf-8") as f:
+                        current_md = f.read()
+                except Exception:
+                    current_md = ""
+                new_md = await run_in_executor(PARSER.refine_persona_markdown, current_md, raw_text)
+                if new_md and new_md != current_md:
+                    with open(PERSONA_FILE_PATH, "w", encoding="utf-8") as f:
+                        f.write(new_md)
+                    PARSER.persona_text = new_md
+                    await update.message.reply_text("已更新你的偏好信息到 persona 文件。")
+                else:
+                    await update.message.reply_text("没有需要更新的偏好信息。")
+            except Exception as exc:
+                logger.exception("Persona update failed")
+                await update.message.reply_text(f"更新偏好失败：{exc}")
+        return
     user_key = _flow_owner_id(update)
     if user_key is not None:
         raw_text = (update.message.text or "").strip()
@@ -408,6 +463,16 @@ async def model_selection_callback(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text(message, reply_markup=_build_model_keyboard())
     except Exception:
         await query.message.reply_text(message)
+
+async def exit_persona_mode_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    chat_id = query.message.chat_id if query.message else None
+    if chat_id in EDIT_PERSONA_CHATS:
+        EDIT_PERSONA_CHATS.discard(chat_id)
+    await query.edit_message_text("已退出偏好编辑模式。")
 
 
 def _flow_owner_id(update: Update) -> Optional[int]:
@@ -668,10 +733,12 @@ def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("model", model_command))
+    application.add_handler(CommandHandler("add_info", add_info_command))
     application.add_handler(CommandHandler("google_auth", google_auth_command))
     application.add_handler(CommandHandler("google_auth_code", google_auth_code_command))
     application.add_handler(CallbackQueryHandler(cancel_google_auth, pattern="^cancel_oauth$"))
     application.add_handler(CallbackQueryHandler(model_selection_callback, pattern="^model_select:"))
+    application.add_handler(CallbackQueryHandler(exit_persona_mode_cb, pattern="^exit_persona_mode$"))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
