@@ -80,6 +80,8 @@ class OpenAIEventParser:
         # Usage tracking per model
         self.usage_by_model: Dict[str, Dict[str, int]] = {}
         self.usage_path = usage_path or ""
+        # Cache whether the upstream supports Responses API; fallback to chat.completions if not.
+        self._responses_supported: bool = True
         if self.usage_path and os.path.exists(self.usage_path):
             try:
                 with open(self.usage_path, "r", encoding="utf-8") as f:
@@ -138,6 +140,10 @@ class OpenAIEventParser:
 
     def _run_completion(self, model: str, user_content):
         system_prompt = self._build_system_prompt()
+        # If we already detected Responses unsupported or model is Gemini-family, go straight to fallback
+        if (not self._responses_supported) or ("gemini" in (model or "").lower()):
+            text = self._fallback_chat_completion(model, system_prompt, user_content)
+            return self._extract_json(text)
         # Try Responses API first
         try:
             response = self.client.responses.create(
@@ -163,7 +169,11 @@ class OpenAIEventParser:
                 pass
             text = self._response_to_text(response)
             return self._extract_json(text)
-        except Exception:
+        except Exception as exc:
+            # Mark Responses unsupported on classic gateway errors to avoid repeated failures
+            msg = str(exc).lower()
+            if "not implemented" in msg or "501" in msg or "convert_request_failed" in msg or "500" in msg:
+                self._responses_supported = False
             # Fallback to Chat Completions for gateways (e.g., Gemini proxy) that don't implement Responses API
             text = self._fallback_chat_completion(model, system_prompt, user_content)
             return self._extract_json(text)
