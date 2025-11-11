@@ -11,14 +11,15 @@ from zoneinfo import ZoneInfo
 from dateutil import parser as date_parser
 from openai import OpenAI
 
-from .models import CalendarEvent, EventExtractionError
+from .models import CalendarEvent, EventExtractionError, ParsedItems, TaskItem
 from .colors import normalize_color_hint
 
 PROMPT_TEMPLATE = """
-You are a meticulous executive assistant. Extract calendar-ready events from the user's input.
+You are a meticulous executive assistant. Extract calendar-ready entries from the user's input.
 Always respond with valid JSON. Use this schema:
 {{
-  "has_event": bool,
+  "has_entry": bool,
+  "entry_type": "event" | "task",
   "title": string,
   "start": ISO 8601 datetime (YYYY-MM-DDTHH:MM, include timezone if known),
   "end": ISO 8601 datetime,
@@ -28,10 +29,14 @@ Always respond with valid JSON. Use this schema:
   "attendees": list of email strings,
   "all_day": bool,
   "category": string (lowercase classification such as work, meeting, personal, travel, study, finance, family, health, reminder, other),
-  "color": string (optional color hint when the user explicitly specifies one, e.g. \"red\", \"blue\", \"green\")
+  "color": string (optional color hint when the user explicitly specifies one, e.g. "red", "blue", "green"),
+  "task_due": ISO 8601 datetime or date string (only for tasks; leave empty if not provided),
+  "task_notes": string (task-specific notes or action items),
+  "task_list": string (optional name when the user specifies a particular task list)
 }}
-If no schedulable event exists, set has_event to false.
+If no schedulable entry exists, set has_entry to false.
 Infer missing timezone from context; default to {default_timezone}.
+Use entry_type="task" for to-dos/reminders without fixed meeting slots; otherwise use "event".
 Always try to set category; use "other" only when unsure. Keep titles short but specific.
 Never fabricate URLs, meeting links, QR codes, or map locations—only include them when the user explicitly shares them.
 """
@@ -62,19 +67,19 @@ class OpenAIEventParser:
         if vision_model:
             self.vision_model = vision_model
 
-    def parse_text(self, text: str, context: Optional[Dict[str, str]] = None) -> List[CalendarEvent]:
+    def parse_text(self, text: str, context: Optional[Dict[str, str]] = None) -> ParsedItems:
         payload = self._run_completion(
             model=self.text_model,
             user_content=[{"type": "input_text", "text": self._build_user_prompt(text, context)}],
         )
-        return self._payload_to_events(payload)
+        return self._payload_to_items(payload)
 
     def parse_image(
         self,
         image_path: str,
         hint: str = "",
         context: Optional[Dict[str, str]] = None,
-    ) -> List[CalendarEvent]:
+    ) -> ParsedItems:
         encoded_image = self._encode_image(image_path)
         content = [
             {"type": "input_text", "text": self._build_user_prompt(hint or "从图片中寻找行程信息。", context)},
@@ -86,7 +91,7 @@ class OpenAIEventParser:
             },
         ]
         payload = self._run_completion(model=self.vision_model, user_content=content)
-        return self._payload_to_events(payload)
+        return self._payload_to_items(payload)
 
     def _run_completion(self, model: str, user_content):
         response = self.client.responses.create(
@@ -152,11 +157,11 @@ class OpenAIEventParser:
                 stripped = candidate.strip()
         return stripped
 
-    def _payload_to_events(self, payload) -> List[CalendarEvent]:
+    def _payload_to_items(self, payload) -> ParsedItems:
+        parsed = ParsedItems()
         if not payload:
-            return []
+            return parsed
 
-        # Support {"events": [...]} or pure list
         if isinstance(payload, dict) and isinstance(payload.get("events"), list):
             candidates = payload["events"]
         elif isinstance(payload, list):
@@ -166,15 +171,18 @@ class OpenAIEventParser:
         else:
             raise EventExtractionError("模型返回了无法识别的结构。")
 
-        events: List[CalendarEvent] = []
         for item in candidates:
             if not isinstance(item, dict):
                 continue
-            if item.get("has_event") is False:
+            if item.get("has_entry") is False and item.get("has_event") is False:
                 continue
-            events.append(self._dict_to_event(item))
+            entry_type = (item.get("entry_type") or "").lower()
+            if entry_type == "task":
+                parsed.tasks.append(self._dict_to_task(item))
+            else:
+                parsed.events.append(self._dict_to_event(item))
 
-        return events
+        return parsed
 
     def _dict_to_event(self, payload: Dict) -> CalendarEvent:
         title = payload.get("title") or "Untitled Event"
@@ -216,6 +224,26 @@ class OpenAIEventParser:
             category=category,
             color_id=color_id,
         )
+
+    def _dict_to_task(self, payload: Dict) -> TaskItem:
+        title = payload.get("title") or "Untitled Task"
+        timezone = payload.get("timezone") or self.default_timezone
+        due_str = payload.get("task_due") or payload.get("due") or ""
+        notes = payload.get("task_notes") or payload.get("description") or ""
+        due_dt: Optional[datetime] = None
+        if due_str:
+            try:
+                due_dt = self._parse_datetime(due_str, timezone)
+            except Exception:
+                due_dt = None
+
+        return TaskItem(
+            title=title.strip(),
+            due=due_dt,
+            timezone=timezone,
+            notes=notes.strip(),
+        )
+
     def _parse_datetime(self, value: str, fallback_tz: str) -> datetime:
         parsed = date_parser.isoparse(value)
         if parsed.tzinfo is None:

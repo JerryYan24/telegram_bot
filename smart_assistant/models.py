@@ -14,6 +14,10 @@ class CalendarSyncError(Exception):
     """Raised when the calendar API rejects an event."""
 
 
+class TaskSyncError(Exception):
+    """Raised when the Google Tasks API rejects a task."""
+
+
 @dataclass
 class CalendarEvent:
     title: str
@@ -103,8 +107,54 @@ class CalendarEvent:
 
 
 @dataclass
+class TaskItem:
+    title: str
+    due: Optional[datetime] = None
+    timezone: str = "UTC"
+    notes: str = ""
+
+    def _resolve_timezone(self) -> ZoneInfo:
+        try:
+            return ZoneInfo(self.timezone)
+        except ZoneInfoNotFoundError:
+            return ZoneInfo("UTC")
+
+    def to_google_body(self) -> dict:
+        body = {"title": self.title}
+        if self.notes:
+            body["notes"] = self.notes
+        if self.due:
+            due_dt = self._normalize_due(self.due)
+            body["due"] = due_dt.isoformat()
+        return body
+
+    def _normalize_due(self, dt: datetime) -> datetime:
+        tz = self._resolve_timezone()
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=tz)
+        return dt.astimezone(tz)
+
+    def to_human_readable(self) -> str:
+        parts = [f"标题: {self.title}"]
+        if self.due:
+            due_dt = self._normalize_due(self.due)
+            parts.append(f"截止: {due_dt.strftime('%Y-%m-%d %H:%M')}")
+        if self.notes:
+            parts.append(f"备注: {self.notes}")
+        return "\n".join(parts)
+
+
+@dataclass
+class ParsedItems:
+    events: List[CalendarEvent] = field(default_factory=list)
+    tasks: List[TaskItem] = field(default_factory=list)
+
+
+@dataclass
 class AssistantResult:
     success: bool
     message: str
     events: List[CalendarEvent] = field(default_factory=list)
     calendar_links: List[str] = field(default_factory=list)
+    tasks: List[TaskItem] = field(default_factory=list)
+    task_links: List[str] = field(default_factory=list)

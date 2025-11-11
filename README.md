@@ -1,6 +1,6 @@
 # Smart Calendar Assistant
 
-一个面向 Telegram 的智能助手。它使用 OpenAI GPT 模型理解邮件、聊天消息和图片海报中的信息，并自动把解析出的日程写入你的 Google Calendar。
+一个面向 Telegram 的智能助手。它使用 OpenAI GPT 模型理解邮件、聊天消息和图片海报中的信息，并自动把解析出的日程写入你的 Google Calendar，同时将待办类事项同步到 Google Tasks。
 
 ## 能力
 - **聊天记事**：直接在 Telegram 里告诉助手要安排的事项，即可落地为日历事件。
@@ -8,6 +8,7 @@
 - **图像理解**：上传活动海报、会议截图等图片，助手会读图提取时间地点再创建日程。
 - **统一语义解析**：所有渠道都通过 OpenAI GPT 模型做意图识别与结构化，确保字段规范。
 - **批量事件**：一次消息里列出多个行程也没问题，会逐条添加到日历并返回摘要。
+- **待办管理**：对“不带具体时间的任务”会落地到 Google Tasks，帮助你区分会议与待办。
 
 ## 架构概览
 1. Telegram Bot (`python-telegram-bot`) 负责和用户交互。
@@ -37,10 +38,10 @@ pip install -r requirements.txt
 | `OPENAI_VISION_MODEL` | （可选）图片解析模型，不填沿用文本模型 |
 | `OPENAI_ALLOWED_MODELS` | （可选）允许 `/model` 命令切换的模型列表，逗号或分号分隔 |
 | `OPENAI_MODEL_STATE_PATH` | （可选）记住上次选择的模型的保存路径，默认 `model_state.json` |
-| `OPENAI_ALLOWED_MODELS` | （可选）允许在 Telegram `/model` 命令中切换的模型列表，逗号分隔 |
 | `GOOGLE_CLIENT_SECRETS_PATH` | Google OAuth client secret JSON（必需） |
 | `GOOGLE_TOKEN_PATH` | OAuth token 保存路径（可选，默认 `google_token.json`） |
 | `GOOGLE_CALENDAR_ID` | 目标日历 ID，默认 `primary` |
+| `GOOGLE_TASK_LIST_ID` | Google Tasks 列表 ID，默认 `@default` |
 | `GOOGLE_DEFAULT_COLOR_ID` | （可选）所有分类都未命中时使用的 `colorId` |
 | `ASSISTANT_DEFAULT_TZ` | 默认时区（IANA 格式，默认 `UTC`） |
 
@@ -63,6 +64,7 @@ google:
   client_secrets_path: "/abs/path/client_secret.json"
   token_path: "google_token.json"
   calendar_id: "primary"
+  task_list_id: "@default"
   category_colors:
     work: "7"        # Peacock
     meeting: "7"
@@ -96,7 +98,7 @@ cp config.example.yaml config.yaml
 2. 下载 client secret JSON，路径填入 `GOOGLE_CLIENT_SECRETS_PATH` 或 `google.client_secrets_path`。
 3. 运行 `python jarvis.py` 启动机器人。
 4. 在 Telegram 与机器人对话中发送 `/google_auth`，它会回复一条授权链接。
-5. 在浏览器里完成 Google 登录并允许访问后，复制回调页面的整条链接或 `code=...` 参数。
+5. 在浏览器里完成 Google 登录并允许访问（同意 Calendar / Tasks 权限）后，复制回调页面的整条链接或 `code=...` 参数。
 6. 回到 Telegram，把页面上显示的 code 原样发送过去（直接粘贴或使用 `/google_auth_code <code>` 均可）。收到成功提示后，令牌会写入 `google.token_path`（默认 `google_token.json`）。下次启动会自动复用，无需再次授权；如需中途取消，可以点聊天里附带的“取消本次授权”按钮再次开始。
 
 ### 颜色分类
@@ -115,6 +117,10 @@ cp config.example.yaml config.yaml
 | reminder | 1（Lavender） |
 
 如需自定义，把 `google.category_colors` 写成一个字典即可，键为小写分类名，值为 Google `colorId`（字符串 1-11，可用官方色名如 `peacock`/`red` 等）。还可以设置 `google.default_color_id`/`GOOGLE_DEFAULT_COLOR_ID` 作为兜底颜色；若想完全禁用默认映射，可在配置里写 `category_colors: {}`。
+
+### 事件 vs 待办
+当用户描述一个没有明确时间/地点、偏向“提醒”或“待办”的事项时，模型会将其标记为 `entry_type="task"` 并写入 `google.task_list_id` 指定的 Google Tasks 列表（默认 `@default`）。涉及具体会议/活动的描述仍会写入 Calendar。这样既能保留会议安排，也能把行动项集中到任务列表里。
+> Google Tasks 暂无稳定的任务详情公开链接，因此机器人回复里的待办链接会跳转到 Tasks 官网 `tasks.google.com`，你可以在其中定位到刚创建的条目。
 
 ### 切换解析模型
 如果你在 `openai.allowed_models`（或 `OPENAI_ALLOWED_MODELS`）里列出了多个模型，可以在 Telegram 里发送 `/model` 查看当前模型和可选列表，再点击按钮或输入 `/model gpt-4o` 之类的命令即时切换。默认情况下会把文本与视觉解析模型一起切换；若在配置里显式设置了 `openai.vision_model`，则图像解析始终使用该模型。最近一次选择会写入 `openai.model_state_path`（默认 `model_state.json`），下次启动自动沿用。

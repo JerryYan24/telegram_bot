@@ -26,6 +26,7 @@ from smart_assistant import (
     CalendarAutomationAssistant,
     EmailEventIngestor,
     GoogleCalendarClient,
+    GoogleTaskClient,
     OpenAIEventParser,
 )
 from smart_assistant.calendar_client import SCOPES
@@ -76,6 +77,7 @@ def bootstrap() -> None:
         CONFIG, "google.token_path", "GOOGLE_TOKEN_PATH", "google_token.json"
     )
     calendar_id = get_config_value(CONFIG, "google.calendar_id", "GOOGLE_CALENDAR_ID", "primary")
+    task_list_id = get_config_value(CONFIG, "google.task_list_id", "GOOGLE_TASK_LIST_ID", "@default")
     default_timezone = get_config_value(
         CONFIG, "assistant.default_tz", "ASSISTANT_DEFAULT_TZ", "UTC"
     )
@@ -136,6 +138,7 @@ def bootstrap() -> None:
         "client_secrets_path": google_client_secrets_path,
         "token_path": google_token_path,
         "calendar_id": calendar_id,
+        "task_list_id": task_list_id,
         "category_colors": category_colors,
         "default_color_id": default_color_id,
     }
@@ -334,15 +337,32 @@ def build_metadata(update: Update, source: str) -> Dict[str, str]:
 
 
 async def reply_with_result(update: Update, result: AssistantResult):
+    blocks = []
     if result.success and result.events:
-        blocks = []
+        event_blocks = []
         for idx, event in enumerate(result.events, start=1):
             block_lines = [f"{idx}. {event.to_human_readable()}"]
             if idx - 1 < len(result.calendar_links):
                 link = result.calendar_links[idx - 1]
                 if link:
                     block_lines.append(f"链接: {link}")
-            blocks.append("\n".join(block_lines))
+            event_blocks.append("\n".join(block_lines))
+        if event_blocks:
+            blocks.append("🗓 日历事件:\n" + "\n\n".join(event_blocks))
+
+    if result.success and result.tasks:
+        task_blocks = []
+        for idx, task in enumerate(result.tasks, start=1):
+            block_lines = [f"{idx}. {task.to_human_readable()}"]
+            if idx - 1 < len(result.task_links):
+                link = result.task_links[idx - 1]
+                if link:
+                    block_lines.append(f"链接: {link}")
+            task_blocks.append("\n".join(block_lines))
+        if task_blocks:
+            blocks.append("✅ 待办事项:\n" + "\n\n".join(task_blocks))
+
+    if blocks:
         message = f"{result.message}\n\n" + "\n\n".join(blocks)
     else:
         message = result.message
@@ -571,14 +591,23 @@ def _initialize_assistant(calendar_client: GoogleCalendarClient) -> None:
     global ASSISTANT
     if not PARSER:
         raise RuntimeError("OpenAI 事件解析器尚未初始化。")
+
+    task_client = None
+    try:
+        task_list_id = GOOGLE_SETTINGS.get("task_list_id", "@default")
+        task_client = GoogleTaskClient(calendar_client.credentials, task_list_id=task_list_id)
+    except Exception as exc:
+        logger.warning("Google Tasks 客户端初始化失败，将仅同步日历：%s", exc)
+
     ASSISTANT = CalendarAutomationAssistant(
         PARSER,
         calendar_client,
+        task_client=task_client,
         category_colors=GOOGLE_SETTINGS.get("category_colors"),
         default_color_id=GOOGLE_SETTINGS.get("default_color_id"),
     )
     _ensure_email_ingestor()
-    logger.info("Google Calendar 凭证已就绪，助手完成初始化。")
+    logger.info("Google Calendar/Tasks 凭证已就绪，助手完成初始化。")
 
 
 def _ensure_email_ingestor() -> None:

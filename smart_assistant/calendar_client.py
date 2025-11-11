@@ -11,7 +11,10 @@ from googleapiclient.errors import HttpError
 
 from .models import CalendarEvent, CalendarSyncError
 
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/tasks",
+]
 
 
 class GoogleCalendarClient:

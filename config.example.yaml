@@ -16,6 +16,7 @@ google:
   client_secrets_path: "/absolute/path/to/client_secret.json"
   token_path: "google_token.json"
   calendar_id: "primary"
+  task_list_id: "@default"
   category_colors:
     work: "7"
     personal: "5"
