@@ -186,5 +186,9 @@ class CalendarAutomationAssistant:
         category = (event.category or "").strip().lower()
         if category and category in self.category_colors:
             event.color_id = self.category_colors[category]
+            self.logger.debug("Applied color '%s' to category '%s'", event.color_id, category)
         elif self.default_color_id:
             event.color_id = self.default_color_id
+            self.logger.debug("Applied default color '%s' to category '%s'", event.color_id, category)
+        else:
+            self.logger.warning("No color applied for category '%s' (not in category_colors and no default_color_id)", category)

@@ -95,6 +95,15 @@ def bootstrap() -> None:
     if not isinstance(category_colors, dict):
         category_colors = None
     default_color_id = get_config_value(CONFIG, "google.default_color_id", "GOOGLE_DEFAULT_COLOR_ID")
+    task_preset_lists = get_config_value(
+        CONFIG,
+        "google.task_preset_lists",
+        "",
+        default=None,
+        cast=lambda value: value,
+    )
+    if not isinstance(task_preset_lists, list):
+        task_preset_lists = []
     allowed_models_raw = get_config_value(
         CONFIG,
         "openai.allowed_models",
@@ -144,8 +153,8 @@ def bootstrap() -> None:
         base_url=openai_base_url,
         text_model=openai_text_model,
         vision_model=openai_vision_model,
-        allowed_task_lists=(GOOGLE_SETTINGS.get("task_preset_lists") or []),
-        allowed_event_categories=list((GOOGLE_SETTINGS.get("category_colors") or {}).keys()),
+        allowed_task_lists=task_preset_lists,
+        allowed_event_categories=list((category_colors or {}).keys()),
         persona_text=persona_text,
         usage_path=usage_path,
     )

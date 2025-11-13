@@ -28,7 +28,7 @@ Always respond with valid JSON. Use this schema:
   "description": string,
   "attendees": list of email strings,
   "all_day": bool,
-  "category": string (lowercase classification such as work, meeting, personal, travel, study, finance, family, health, shopping, reminder, other),
+  "category": string (lowercase classification; see constraints below),
   "color": string (optional color hint when the user explicitly specifies one, e.g. "red", "blue", "green"),
   "task_due": ISO 8601 datetime or date string (only for tasks; leave empty if not provided),
   "task_notes": string (task-specific notes or action items),
@@ -201,7 +201,8 @@ class OpenAIEventParser:
         if self.allowed_event_categories:
             cats_str = ", ".join(f'"{name}"' for name in self.allowed_event_categories)
             guidance_parts.append(
-                f"When entry_type is \"event\", choose category only from: [{cats_str}]."
+                f"CRITICAL: When entry_type is \"event\", the category field MUST be exactly one of: [{cats_str}]. "
+                f"Do not use any other category names. If the event doesn't clearly match any category, choose the closest one from this list."
             )
         if self.allowed_task_lists:
             lists_str = ", ".join(f'"{name}"' for name in self.allowed_task_lists)
@@ -570,11 +571,53 @@ class OpenAIEventParser:
 
         return parsed
 
+    def _normalize_category(self, category: str) -> str:
+        """Normalize category to match allowed_event_categories if configured."""
+        if not category or not self.allowed_event_categories:
+            return category
+        
+        category_lower = category.strip().lower()
+        original_category = category_lower
+        
+        # Exact match
+        if category_lower in self.allowed_event_categories:
+            return category_lower
+        
+        # Common mappings for similar categories
+        category_mappings = {
+            "health": "medical",
+            "family": "personal",
+            "study": "work",
+            "education": "work",
+            "finance": "work",
+            "shopping": "personal",
+            "trip": "travel",
+            "call": "meeting",
+        }
+        
+        # Try mapping
+        mapped = category_mappings.get(category_lower)
+        if mapped and mapped in self.allowed_event_categories:
+            self.logger.info("Mapped category '%s' to '%s'", original_category, mapped)
+            return mapped
+        
+        # Find closest match by substring or similarity
+        for allowed in self.allowed_event_categories:
+            if allowed in category_lower or category_lower in allowed:
+                self.logger.info("Mapped category '%s' to '%s' (substring match)", original_category, allowed)
+                return allowed
+        
+        # If no match found, use the first allowed category as fallback
+        fallback = self.allowed_event_categories[0]
+        self.logger.warning("Category '%s' not in allowed list, using fallback '%s'", original_category, fallback)
+        return fallback
+
     def _dict_to_event(self, payload: Dict) -> CalendarEvent:
         title = payload.get("title") or "Untitled Event"
         timezone = payload.get("timezone") or self.default_timezone
         all_day = bool(payload.get("all_day"))
         category = (payload.get("category") or payload.get("classification") or payload.get("type") or "").strip()
+        category = self._normalize_category(category)
 
         start_str = payload.get("start") or payload.get("start_time")
         end_str = payload.get("end") or payload.get("end_time")
