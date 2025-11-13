@@ -57,6 +57,21 @@ NEW MESSAGE:
 {new_message}
 """
 
+TODAY_SUMMARY_PROMPT = """
+You are an executive assistant. Summarize today's plan based on calendar events and tasks.
+Constraints:
+- Output a concise, well-structured Chinese summary (bullet list or short paragraphs).
+- Start with a one-line headline. Then list time-ordered events, then prioritized tasks.
+- Highlight deadlines/time-sensitive items first.
+- Keep under 200-250 Chinese characters if possible.
+
+DATE: {date_str} ({tz})
+CALENDAR:
+{calendar_block}
+
+TASKS:
+{tasks_block}
+"""
 
 class OpenAIEventParser:
     def __init__(
@@ -447,6 +462,48 @@ class OpenAIEventParser:
                 json.dump(payload, f, ensure_ascii=False)
         except Exception:
             pass
+
+    def summarize_today(self, date_str: str, tz: str, calendar_items: List[dict], task_items: List[dict]) -> str:
+        """Generate a concise Chinese summary for today's agenda."""
+        def format_event(e: dict) -> str:
+            title = e.get("summary") or e.get("title") or ""
+            start = e.get("start", {})
+            end = e.get("end", {})
+            def pick_time(x):
+                return x.get("dateTime") or x.get("date") or ""
+            return f"- {pick_time(start)} ~ {pick_time(end)} {title}".strip()
+
+        def format_task(t: dict) -> str:
+            title = t.get("title") or ""
+            due = t.get("due") or ""
+            return f"- {due} {title}".strip()
+
+        calendar_block = "\n".join(format_event(e) for e in calendar_items) or "- (无)"
+        tasks_block = "\n".join(format_task(t) for t in task_items) or "- (无)"
+        user_content = TODAY_SUMMARY_PROMPT.format(
+            date_str=date_str, tz=tz, calendar_block=calendar_block, tasks_block=tasks_block
+        )
+        # Prefer Responses API unless disabled for this model
+        if (not self._responses_supported) or ("gemini" in (self.text_model or "").lower()):
+            text = self._fallback_chat_completion(
+                self.text_model, "You write concise daily plans.", [{"type": "input_text", "text": user_content}]
+            )
+            return (text or "").strip()
+        try:
+            response = self.client.responses.create(
+                model=self.text_model,
+                input=[
+                    {"role": "system", "content": "You write concise daily plans."},
+                    {"role": "user", "content": [{"type": "input_text", "text": user_content}]},
+                ],
+            )
+            text = self._response_to_text(response)
+            return (text or "").strip()
+        except Exception:
+            text = self._fallback_chat_completion(
+                self.text_model, "You write concise daily plans.", [{"type": "input_text", "text": user_content}]
+            )
+            return (text or "").strip()
 
     def _extract_json(self, raw_text: str):
         normalized = self._strip_code_fences(raw_text)

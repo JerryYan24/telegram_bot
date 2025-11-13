@@ -57,6 +57,7 @@ CURRENT_VISION_MODEL: str = ""
 MODEL_STATE_PATH: str = "model_state.json"
 PERSONA_FILE_PATH: Optional[str] = None
 EDIT_PERSONA_CHATS: set[int] = set()
+TODAY_CACHE_PATH: str = "today_cache.json"
 
 
 def bootstrap() -> None:
@@ -124,6 +125,9 @@ def bootstrap() -> None:
     global PERSONA_FILE_PATH
     PERSONA_FILE_PATH = persona_file
     usage_path = assistant_cfg.get("usage_path")
+    today_cache_path = assistant_cfg.get("today_cache_path") or "today_cache.json"
+    global TODAY_CACHE_PATH
+    TODAY_CACHE_PATH = today_cache_path
     if persona_file:
         try:
             with open(persona_file, "r", encoding="utf-8") as f:
@@ -236,6 +240,99 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = PARSER.get_usage_summary_lines()
     await update.message.reply_text("模型用量（tokens）:\n" + "\n".join(lines))
 
+def _load_today_cache() -> Dict[str, str]:
+    try:
+        path = Path(TODAY_CACHE_PATH).expanduser()
+        if path.exists():
+            return json.loads(path.read_text() or "{}")
+    except Exception:
+        pass
+    return {}
+
+def _save_today_cache(cache: Dict[str, str]) -> None:
+    try:
+        path = Path(TODAY_CACHE_PATH).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cache, ensure_ascii=False))
+    except Exception:
+        pass
+
+async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ASSISTANT or not PARSER:
+        await update.message.reply_text("助手尚未初始化。")
+        return
+    # Compute today's window in default timezone
+    now_utc = datetime.now(timezone.utc)
+    try:
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+    except ZoneInfoNotFoundError:
+        tz = ZoneInfo("UTC")
+    local_today = now_utc.astimezone(tz).date()
+    start_local = datetime(local_today.year, local_today.month, local_today.day, 0, 0, tzinfo=tz)
+    end_local = start_local + timedelta(days=1)
+    date_key = local_today.isoformat()
+
+    # Cache check
+    cache = _load_today_cache()
+    if date_key in cache and not context.args:
+        await update.message.reply_text(cache[date_key], reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("重新生成", callback_data="today_regen")]]))
+        return
+
+    # Fetch events and tasks
+    try:
+        start_iso = start_local.astimezone(timezone.utc).isoformat()
+        end_iso = end_local.astimezone(timezone.utc).isoformat()
+        events = ASSISTANT.calendar_client.list_events(start_iso, end_iso)
+    except Exception as exc:
+        events = []
+        logger.warning("Failed to list today's events: %s", exc)
+    try:
+        tasks = ASSISTANT.task_client.list_tasks_for_date(date_key, DEFAULT_TIMEZONE) if ASSISTANT.task_client else []
+    except Exception as exc:
+        tasks = []
+        logger.warning("Failed to list today's tasks: %s", exc)
+
+    # Summarize
+    summary = PARSER.summarize_today(date_key, DEFAULT_TIMEZONE, events, tasks) or "今天暂无安排。"
+    cache[date_key] = summary
+    _save_today_cache(cache)
+    await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("重新生成", callback_data="today_regen")]]))
+
+async def today_regen_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ASSISTANT or not PARSER:
+        return
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    now_utc = datetime.now(timezone.utc)
+    try:
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+    except ZoneInfoNotFoundError:
+        tz = ZoneInfo("UTC")
+    local_today = now_utc.astimezone(tz).date()
+    start_local = datetime(local_today.year, local_today.month, local_today.day, 0, 0, tzinfo=tz)
+    end_local = start_local + timedelta(days=1)
+    date_key = local_today.isoformat()
+
+    try:
+        start_iso = start_local.astimezone(timezone.utc).isoformat()
+        end_iso = end_local.astimezone(timezone.utc).isoformat()
+        events = ASSISTANT.calendar_client.list_events(start_iso, end_iso)
+    except Exception as exc:
+        events = []
+    try:
+        tasks = ASSISTANT.task_client.list_tasks_for_date(date_key, DEFAULT_TIMEZONE) if ASSISTANT.task_client else []
+    except Exception:
+        tasks = []
+    summary = PARSER.summarize_today(date_key, DEFAULT_TIMEZONE, events, tasks) or "今天暂无安排。"
+    cache = _load_today_cache()
+    cache[date_key] = summary
+    _save_today_cache(cache)
+    try:
+        await query.edit_message_text(summary, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("重新生成", callback_data="today_regen")]]))
+    except Exception:
+        await query.message.reply_text(summary, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("重新生成", callback_data="today_regen")]]))
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not PARSER:
@@ -742,6 +839,8 @@ def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("usage", usage_command))
+    application.add_handler(CommandHandler("today", today_command))
+    application.add_handler(CallbackQueryHandler(today_regen_cb, pattern="^today_regen$"))
     application.add_handler(CommandHandler("model", model_command))
     application.add_handler(CommandHandler("add_info", add_info_command))
     application.add_handler(CommandHandler("google_auth", google_auth_command))

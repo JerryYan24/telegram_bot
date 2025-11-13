@@ -53,6 +53,24 @@ class GoogleCalendarClient:
             self.logger.exception("Google Calendar API error: %s", exc)
             raise CalendarSyncError(exc) from exc
 
+    def list_events(self, time_min_iso: str, time_max_iso: str) -> list:
+        """List events between time_min and time_max (ISO8601, UTC or with TZ)."""
+        try:
+            events_result = (
+                self.service.events()
+                .list(
+                    calendarId=self.calendar_id,
+                    timeMin=time_min_iso,
+                    timeMax=time_max_iso,
+                    singleEvents=True,
+                    orderBy="startTime",
+                )
+                .execute()
+            )
+            return events_result.get("items", []) or []
+        except HttpError as exc:
+            self.logger.exception("Google Calendar API list error: %s", exc)
+            raise CalendarSyncError(exc) from exc
     def _load_user_credentials(
         self, client_secrets_path: str, token_path: str, allow_interactive: bool = True
     ) -> Credentials:

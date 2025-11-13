@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import logging
 from typing import Dict, Optional, Tuple, List, Set
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from .models import TaskItem, TaskSyncError
+from dateutil import parser as date_parser
 
 
 class GoogleTaskClient:
@@ -203,6 +206,55 @@ class GoogleTaskClient:
         list_id = self._extract_list_id(created)
         # Public deep links are not officially supported; fall back to main Tasks site.
         return "https://tasks.google.com/"
+
+    def list_tasks_for_date(self, local_date_str: str, timezone_name: str = "UTC") -> list:
+        """List tasks due on the given local date using server-side filtering (dueMin/dueMax).
+        This avoids client-side timezone edge cases. Aggregates preset lists + default."""
+        tasks: list = []
+        try:
+            target_tz = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError:
+            target_tz = ZoneInfo("UTC")
+        try:
+            # Compute [start,end) window in UTC for the given local date
+            year, month, day = [int(x) for x in local_date_str.split("-")]
+            start_local = datetime(year, month, day, 0, 0, 0, tzinfo=target_tz)
+            end_local = start_local.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+            due_min = start_local.astimezone(timezone.utc).isoformat()
+            due_max = end_local.astimezone(timezone.utc).isoformat()
+
+            mapping = self._refresh_list_cache()
+            # Scan ALL lists to avoid missing tasks created into non-preset lists
+            target_list_ids: List[str] = list(mapping.values())
+            for list_id in target_list_ids:
+                page_token = None
+                while True:
+                    resp = (
+                        self.service.tasks()
+                        .list(
+                            tasklist=list_id,
+                            showCompleted=False,
+                            showDeleted=False,
+                            maxResults=100,
+                            dueMin=due_min,
+                            dueMax=due_max,
+                            pageToken=page_token,
+                        )
+                        .execute()
+                    )
+                    for item in resp.get("items", []) or []:
+                        # Status double-check and annotate list id
+                        if item.get("status") == "completed":
+                            continue
+                        item["_list_id"] = list_id
+                        tasks.append(item)
+                    page_token = resp.get("nextPageToken")
+                    if not page_token:
+                        break
+        except HttpError as exc:
+            self.logger.exception("Google Tasks API list error: %s", exc)
+            # return what we have
+        return tasks
 
     def _extract_list_id(self, created: dict) -> str:
         self_link = created.get("selfLink") or ""
