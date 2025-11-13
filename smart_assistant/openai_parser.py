@@ -86,6 +86,7 @@ class OpenAIEventParser:
         allowed_event_categories: Optional[List[str]] = None,
         persona_text: Optional[str] = None,
         usage_path: Optional[str] = None,
+        audit_logger=None,
     ):
         self.default_timezone = default_timezone
         self.text_model = text_model
@@ -96,6 +97,7 @@ class OpenAIEventParser:
         # Usage tracking per model
         self.usage_by_model: Dict[str, Dict[str, int]] = {}
         self.usage_path = usage_path or ""
+        self.audit_logger = audit_logger  # Optional audit logger for API usage
         # Cache whether the upstream supports Responses API; fallback to chat.completions if not.
         self._responses_supported: bool = True
         if self.usage_path and os.path.exists(self.usage_path):
@@ -181,6 +183,18 @@ class OpenAIEventParser:
                     bucket["completion"] += completion_toks
                     bucket["total"] += (total_toks or (prompt_toks + completion_toks))
                     self._persist_usage()
+                    
+                    # 记录到审计日志系统
+                    if self.audit_logger:
+                        try:
+                            self.audit_logger.log_api_usage(
+                                model=model,
+                                prompt_tokens=prompt_toks,
+                                completion_tokens=completion_toks,
+                                total_tokens=total_toks or (prompt_toks + completion_toks),
+                            )
+                        except Exception:
+                            pass  # 不影响主流程
             except Exception:
                 pass
             text = self._response_to_text(response)
@@ -317,6 +331,18 @@ class OpenAIEventParser:
                     bucket["completion"] += completion_toks
                     bucket["total"] += (total_toks or (prompt_toks + completion_toks))
                     self._persist_usage()
+                    
+                    # 记录到审计日志系统
+                    if self.audit_logger:
+                        try:
+                            self.audit_logger.log_api_usage(
+                                model=model,
+                                prompt_tokens=prompt_toks,
+                                completion_tokens=completion_toks,
+                                total_tokens=total_toks or (prompt_toks + completion_toks),
+                            )
+                        except Exception:
+                            pass  # 不影响主流程
             except Exception:
                 pass
             # Extract text

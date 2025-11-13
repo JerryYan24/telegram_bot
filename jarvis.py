@@ -6,6 +6,7 @@ import tempfile
 from datetime import datetime, timezone, timedelta
 from functools import partial
 from pathlib import Path
+from traceback import format_exc
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -29,6 +30,7 @@ from smart_assistant import (
     GoogleTaskClient,
     OpenAIEventParser,
 )
+from smart_assistant.audit_logger import AuditLogger
 from smart_assistant.calendar_client import SCOPES
 from smart_assistant.config import get_config_value, load_config
 from smart_assistant.models import AssistantResult
@@ -48,6 +50,7 @@ DEFAULT_TIMEZONE: str = "UTC"
 PARSER: Optional[OpenAIEventParser] = None
 GOOGLE_SETTINGS: Dict[str, object] = {}
 EMAIL_SETTINGS: Dict[str, object] = {}
+AUDIT_LOGGER: Optional[AuditLogger] = None
 PENDING_OAUTH_FLOWS: Dict[int, Dict[str, object]] = {}
 OOB_REDIRECT_URI = "urn:ietf:wg:oauth:2.0:oob"
 ALLOWED_MODELS: List[str] = []
@@ -61,12 +64,25 @@ TODAY_CACHE_PATH: str = "today_cache.json"
 
 
 def bootstrap() -> None:
-    global ASSISTANT, EMAIL_INGESTOR, TELEGRAM_TOKEN, CONFIG, DEFAULT_TIMEZONE, PARSER, GOOGLE_SETTINGS, EMAIL_SETTINGS
+    global ASSISTANT, EMAIL_INGESTOR, TELEGRAM_TOKEN, CONFIG, DEFAULT_TIMEZONE, PARSER, GOOGLE_SETTINGS, EMAIL_SETTINGS, AUDIT_LOGGER
 
     config_path = os.getenv("ASSISTANT_CONFIG_PATH")
     CONFIG = load_config(config_path)
     if CONFIG:
         logger.info("Loaded config from %s", config_path or "config.yaml")
+    
+    # 初始化审计日志系统
+    log_dir = get_config_value(CONFIG, "assistant.log_dir", "ASSISTANT_LOG_DIR", "logs")
+    retention_days_raw = get_config_value(CONFIG, "assistant.log_retention_days", "ASSISTANT_LOG_RETENTION_DAYS", 7)
+    retention_days = int(retention_days_raw) if retention_days_raw else 7
+    log_http_raw = get_config_value(CONFIG, "assistant.log_http", "ASSISTANT_LOG_HTTP", False)
+    log_http = str(log_http_raw).lower() in ("true", "1", "yes") if isinstance(log_http_raw, str) else bool(log_http_raw)
+    AUDIT_LOGGER = AuditLogger(
+        log_dir=log_dir,
+        retention_days=retention_days,
+        log_http=log_http,
+    )
+    logger.info("Audit logging initialized (retention: %d days, log_http: %s)", retention_days, log_http)
 
     TELEGRAM_TOKEN = get_config_value(CONFIG, "telegram.bot_token", "TELEGRAM_BOT_TOKEN")
     openai_key = get_config_value(CONFIG, "openai.api_key", "OPENAI_API_KEY")
@@ -157,6 +173,7 @@ def bootstrap() -> None:
         allowed_event_categories=list((category_colors or {}).keys()),
         persona_text=persona_text,
         usage_path=usage_path,
+        audit_logger=AUDIT_LOGGER,  # 传递审计日志器以记录 API 使用量
     )
     PARSER = parser
     global ALLOWED_MODELS, CURRENT_MODEL, BASE_VISION_MODEL, CURRENT_VISION_MODEL, MODEL_STATE_PATH
@@ -429,6 +446,11 @@ async def google_auth_code_command(update: Update, context: ContextTypes.DEFAULT
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = str(user.id) if user else "unknown"
+    username = user.username if user else None
+    input_text = (update.message.text or "").strip()
+    
     # Persona edit mode first
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id in EDIT_PERSONA_CHATS and PARSER and PERSONA_FILE_PATH:
@@ -466,11 +488,58 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text or ""
     metadata = build_metadata(update, source="telegram-text")
-    result = await run_in_executor(ASSISTANT.process_text_payload, text, metadata)
-    await reply_with_result(update, result)
+    
+    try:
+        result = await run_in_executor(ASSISTANT.process_text_payload, text, metadata)
+        output_text = result.message
+        if result.events:
+            output_text += f"\n\n{len(result.events)} 个日历事件"
+        if result.tasks:
+            output_text += f"\n\n{len(result.tasks)} 条待办"
+        
+        # 记录用户交互
+        if AUDIT_LOGGER:
+            metadata_log = {}
+            if result.events:
+                metadata_log["events_count"] = len(result.events)
+                metadata_log["event_titles"] = [e.title for e in result.events]
+            if result.tasks:
+                metadata_log["tasks_count"] = len(result.tasks)
+            if result.calendar_links:
+                metadata_log["has_calendar_links"] = True
+            
+            AUDIT_LOGGER.log_user_interaction(
+                user_id=user_id,
+                username=username,
+                input_text=input_text,
+                output_text=output_text,
+                success=result.success,
+                source="telegram-text",
+                metadata=metadata_log if metadata_log else None,
+            )
+        
+        await reply_with_result(update, result)
+    except Exception as exc:
+        # 记录错误
+        if AUDIT_LOGGER:
+            AUDIT_LOGGER.log_error(
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+                user_id=user_id,
+                username=username,
+                context={"input": input_text[:500]},
+                traceback=format_exc() if hasattr(exc, "__traceback__") else None,
+            )
+        logger.exception("Error processing text message")
+        await update.message.reply_text(f"处理失败：{exc}")
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = str(user.id) if user else "unknown"
+    username = user.username if user else None
+    hint = (update.message.caption or "").strip()
+    
     if not ASSISTANT:
         await update.message.reply_text("助手尚未初始化，请先发送 /google_auth 完成授权。")
         return
@@ -483,14 +552,52 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await telegram_file.download_to_drive(tmp.name)
         temp_path = tmp.name
     try:
-        hint = update.message.caption or ""
         metadata = build_metadata(update, source="telegram-photo")
         result = await run_in_executor(ASSISTANT.process_image_payload, temp_path, hint, metadata)
+        
+        # 记录用户交互
+        if AUDIT_LOGGER:
+            output_text = result.message
+            if result.events:
+                output_text += f"\n\n{len(result.events)} 个日历事件"
+            if result.tasks:
+                output_text += f"\n\n{len(result.tasks)} 条待办"
+            
+            metadata_log = {"has_image": True, "hint": hint}
+            if result.events:
+                metadata_log["events_count"] = len(result.events)
+            if result.tasks:
+                metadata_log["tasks_count"] = len(result.tasks)
+            
+            AUDIT_LOGGER.log_user_interaction(
+                user_id=user_id,
+                username=username,
+                input_text=f"[Image] {hint}" if hint else "[Image]",
+                output_text=output_text,
+                success=result.success,
+                source="telegram-photo",
+                metadata=metadata_log,
+            )
+    except Exception as exc:
+        # 记录错误
+        if AUDIT_LOGGER:
+            AUDIT_LOGGER.log_error(
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+                user_id=user_id,
+                username=username,
+                context={"hint": hint, "has_image": True},
+                traceback=format_exc() if hasattr(exc, "__traceback__") else None,
+            )
+        logger.exception("Error processing photo")
+        await update.message.reply_text(f"处理图片失败：{exc}")
+        return
     finally:
         try:
             os.unlink(temp_path)
         except FileNotFoundError:
             pass
+    
     await reply_with_result(update, result)
 
 
@@ -616,11 +723,26 @@ def _handle_model_switch(target: str) -> str:
         return f"未知模型: {target}。可选项：{allowed_str}"
     if normalized == CURRENT_MODEL:
         return f"当前已使用模型 {normalized}。"
+    
+    old_model = CURRENT_MODEL
     vision_model = BASE_VISION_MODEL or normalized
     CURRENT_MODEL = normalized
     CURRENT_VISION_MODEL = vision_model
     _apply_current_model_to_parser()
     _persist_model_state()
+    
+    # 记录模型切换事件
+    if AUDIT_LOGGER:
+        AUDIT_LOGGER.log_system_event(
+            event_type="model_change",
+            description=f"Model switched from {old_model} to {normalized}",
+            metadata={
+                "old_model": old_model,
+                "new_model": normalized,
+                "vision_model": vision_model,
+            },
+        )
+    
     return f"解析模型已切换为 {normalized}。"
 
 
@@ -754,6 +876,19 @@ async def _process_oauth_code(
         return True
 
     _initialize_assistant(calendar_client)
+    
+    # 记录授权成功事件
+    if AUDIT_LOGGER:
+        user = update.effective_user
+        AUDIT_LOGGER.log_system_event(
+            event_type="auth_success",
+            description="Google OAuth authorization completed",
+            metadata={
+                "user_id": str(user.id) if user else None,
+                "username": user.username if user else None,
+            },
+        )
+    
     await update.message.reply_text("Google 授权成功，现在可以开始创建日程了！")
     return True
 
@@ -796,6 +931,17 @@ def _initialize_assistant(calendar_client: GoogleCalendarClient) -> None:
     )
     _ensure_email_ingestor()
     logger.info("Google Calendar/Tasks 凭证已就绪，助手完成初始化。")
+    
+    # 记录助手初始化事件
+    if AUDIT_LOGGER:
+        AUDIT_LOGGER.log_system_event(
+            event_type="assistant_initialized",
+            description="Calendar automation assistant initialized",
+            metadata={
+                "has_task_client": task_client is not None,
+                "calendar_id": calendar_client.calendar_id,
+            },
+        )
 
 
 def _ensure_email_ingestor() -> None:
