@@ -513,14 +513,14 @@ async def reply_with_result(update: Update, result: AssistantResult):
     if result.success and result.events:
         event_blocks = []
         for idx, event in enumerate(result.events, start=1):
-            block_lines = [f"{idx}. {event.to_human_readable()}"]
+            block_lines = [event.to_human_readable()]
             if idx - 1 < len(result.calendar_links):
                 link = result.calendar_links[idx - 1]
                 if link:
                     block_lines.append(f"链接: {link}")
             event_blocks.append("\n".join(block_lines))
         if event_blocks:
-            blocks.append("🗓 日历事件:\n" + "\n\n".join(event_blocks))
+            blocks.append("\n\n".join(event_blocks))
 
     if result.success and result.tasks:
         task_blocks = []

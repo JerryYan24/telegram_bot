@@ -30,6 +30,7 @@ Always respond with valid JSON. Use this schema:
   "all_day": bool,
   "category": string (lowercase classification; see constraints below),
   "color": string (optional color hint when the user explicitly specifies one, e.g. "red", "blue", "green"),
+  "emoji": string (optional emoji icon that best represents the event type; choose any appropriate emoji that fits the event, e.g. 🅿️ for parking, 🏥 for medical, ✈️ for travel, 💼 for work/meeting, etc.),
   "task_due": ISO 8601 datetime or date string (only for tasks; leave empty if not provided),
   "task_notes": string (task-specific notes or action items),
   "task_list": string (optional name when the user specifies a particular task list)
@@ -640,6 +641,7 @@ class OpenAIEventParser:
         location = payload.get("location") or ""
         color_hint = payload.get("color_id") or payload.get("colorId") or payload.get("color")
         color_id = normalize_color_hint(color_hint)
+        emoji = (payload.get("emoji") or "").strip()
 
         return CalendarEvent(
             title=title.strip(),
@@ -652,6 +654,7 @@ class OpenAIEventParser:
             all_day=all_day,
             category=category,
             color_id=color_id,
+            emoji=emoji,
         )
 
     def _dict_to_task(self, payload: Dict) -> TaskItem:

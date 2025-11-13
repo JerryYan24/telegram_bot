@@ -30,6 +30,7 @@ class CalendarEvent:
     all_day: bool = False
     category: str = ""
     color_id: Optional[str] = None
+    emoji: str = ""  # Emoji for Telegram display
 
     def _resolve_timezone(self) -> ZoneInfo:
         """Resolve configured timezone with UTC fallback."""
@@ -62,11 +63,21 @@ class CalendarEvent:
                 "timeZone": self.timezone,
             }
 
+        # Build description for Google Calendar (without emoji)
+        description_parts = []
+        if self.description:
+            description_parts.append(self.description)
+        if self.attendees:
+            description_parts.append(f"Attendees: {', '.join(self.attendees)}")
+        if self.category:
+            description_parts.append(f"Category: {self.category}")
+        google_description = "\n".join(description_parts) if description_parts else ""
+        
         body = {
-            "summary": self.title,
+            "summary": self.title,  # Google Calendar title (no emoji)
             "start": start_payload,
             "end": end_payload,
-            "description": self.description,
+            "description": google_description,
         }
 
         if self.location:
@@ -84,25 +95,52 @@ class CalendarEvent:
         """Return a friendly string for Telegram responses."""
         start_dt = self._normalize_datetime(self.start)
         end_dt = self._normalize_datetime(self.end)
-        date_fmt = "%Y-%m-%d" if self.all_day else "%Y-%m-%d %H:%M"
-        start_str = start_dt.strftime(date_fmt)
-        end_str = end_dt.strftime(date_fmt)
-        parts = [
-            f"标题: {self.title}",
-            f"开始: {start_str}",
-            f"结束: {end_str}",
-            f"时区: {self.timezone}",
-        ]
+        
+        # Format date and time
+        # Use English month abbreviations and day names
+        month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+        
+        if self.all_day:
+            start_date = f"{start_dt.day} {month_names[start_dt.month-1]} ({day_names[start_dt.weekday()]})"
+            end_date = f"{end_dt.day} {month_names[end_dt.month-1]} ({day_names[end_dt.weekday()]})"
+            if start_date == end_date:
+                date_str = start_date
+            else:
+                date_str = f"{start_date} - {end_date}"
+            time_str = "All day"
+        else:
+            start_date = f"{start_dt.day} {month_names[start_dt.month-1]} ({day_names[start_dt.weekday()]})"
+            end_date = f"{end_dt.day} {month_names[end_dt.month-1]} ({day_names[end_dt.weekday()]})"
+            start_time = start_dt.strftime("%H:%M")
+            end_time = end_dt.strftime("%H:%M")
+            
+            if start_date == end_date:
+                date_str = start_date
+                time_str = f"{start_time} - {end_time}"
+            else:
+                date_str = f"{start_date} - {end_date}"
+                time_str = f"{start_time} - {end_time}"
+        
+        # Build formatted output
+        emoji_prefix = f"{self.emoji} " if self.emoji else ""
+        title_line = f"{emoji_prefix}[{self.title}] Added"
+        
+        parts = [title_line]
+        
         if self.location:
-            parts.append(f"地点: {self.location}")
+            parts.append(f"@ {self.location}")
+        
+        parts.append(f" · Date: {date_str}")
+        parts.append(f" · Time: {time_str}")
+        
         if self.description:
-            parts.append(f"说明: {self.description}")
+            parts.append(f" · Notes: {self.description}")
+        
         if self.attendees:
-            parts.append(f"参与者: {', '.join(self.attendees)}")
-        if self.category:
-            parts.append(f"分类: {self.category}")
-        if self.color_id:
-            parts.append(f"颜色ID: {self.color_id}")
+            parts.append(f" · Attendees: {', '.join(self.attendees)}")
+        
         return "\n".join(parts)
 
 
