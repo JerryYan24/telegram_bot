@@ -1,10 +1,11 @@
+import asyncio
 import email
 import imaplib
 import logging
 import threading
 from contextlib import closing
 from email.header import decode_header, make_header
-from typing import Optional
+from typing import Callable, Optional
 
 
 class EmailEventIngestor:
@@ -18,6 +19,8 @@ class EmailEventIngestor:
         port: Optional[int] = None,
         use_ssl: bool = True,
         poll_interval: int = 60,
+        notification_callback: Optional[Callable] = None,
+        main_event_loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
         self.host = host
         self.username = username
@@ -27,6 +30,8 @@ class EmailEventIngestor:
         self.use_ssl = use_ssl
         self.poll_interval = poll_interval
         self.assistant = assistant
+        self.notification_callback = notification_callback  # 用于发送 Telegram 通知的回调
+        self._main_loop = main_event_loop  # Telegram bot 的主事件循环
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -80,6 +85,36 @@ class EmailEventIngestor:
                 if result.success and result.events:
                     mailbox.store(message_id, "+FLAGS", "\\Seen")
                     self.logger.info("Event created from email '%s' (%d events)", subject, len(result.events))
+                    
+                    # 发送 Telegram 通知
+                    if self.notification_callback:
+                        try:
+                            # 在后台线程中运行异步回调
+                            if asyncio.iscoroutinefunction(self.notification_callback):
+                                # 尝试获取主事件循环（Telegram bot 的事件循环）
+                                try:
+                                    # 从线程本地存储获取主循环
+                                    main_loop = getattr(self, '_main_loop', None)
+                                    if main_loop and main_loop.is_running():
+                                        # 使用 run_coroutine_threadsafe 安全地调用
+                                        future = asyncio.run_coroutine_threadsafe(
+                                            self.notification_callback(result, subject),
+                                            main_loop
+                                        )
+                                        # 不等待结果，让它在后台执行
+                                    else:
+                                        # 如果没有主循环，创建一个新的事件循环
+                                        loop = asyncio.new_event_loop()
+                                        asyncio.set_event_loop(loop)
+                                        loop.run_until_complete(self.notification_callback(result, subject))
+                                        loop.close()
+                                except Exception as loop_exc:
+                                    self.logger.warning("Failed to get event loop for notification: %s", loop_exc)
+                            else:
+                                # 同步回调
+                                self.notification_callback(result, subject)
+                        except Exception as exc:
+                            self.logger.warning("Failed to send Telegram notification: %s", exc)
                 else:
                     self.logger.info("Email '%s' did not contain an event.", subject)
 

@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -45,6 +45,7 @@ logger = logging.getLogger("SmartAssistantBot")
 ASSISTANT: Optional[CalendarAutomationAssistant] = None
 EMAIL_INGESTOR: Optional[EmailEventIngestor] = None
 TELEGRAM_TOKEN: Optional[str] = None
+TELEGRAM_APPLICATION = None  # Telegram bot application instance
 CONFIG: Dict[str, object] = {}
 DEFAULT_TIMEZONE: str = "UTC"
 PARSER: Optional[OpenAIEventParser] = None
@@ -508,6 +509,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if result.calendar_links:
                 metadata_log["has_calendar_links"] = True
             
+            # 添加 chat_id 到 metadata 以便后续通知
+            if not metadata_log:
+                metadata_log = {}
+            chat = update.effective_chat
+            if chat:
+                metadata_log["chat_id"] = str(chat.id)
+            
             AUDIT_LOGGER.log_user_interaction(
                 user_id=user_id,
                 username=username,
@@ -569,6 +577,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if result.tasks:
                 metadata_log["tasks_count"] = len(result.tasks)
             
+            # 添加 chat_id 到 metadata 以便后续通知
+            chat = update.effective_chat
+            if chat:
+                metadata_log["chat_id"] = str(chat.id)
+            
             AUDIT_LOGGER.log_user_interaction(
                 user_id=user_id,
                 username=username,
@@ -613,6 +626,128 @@ def build_metadata(update: Update, source: str) -> Dict[str, str]:
         "current_time_local": local_time,
         "current_time_utc": utc_time,
     }
+
+
+async def send_email_notification(result: AssistantResult, email_subject: str) -> None:
+    """发送邮件创建事件的 Telegram 通知"""
+    global TELEGRAM_APPLICATION, TELEGRAM_TOKEN, AUDIT_LOGGER
+    
+    if not TELEGRAM_TOKEN:
+        return
+    
+    # 获取所有最近与机器人交互的用户 chat_id
+    chat_ids = set()
+    
+    # 方法1: 从配置中获取（如果配置了）
+    notification_chat_id = get_config_value(CONFIG, "telegram.notification_chat_id", "TELEGRAM_NOTIFICATION_CHAT_ID")
+    if notification_chat_id:
+        try:
+            chat_ids.add(int(notification_chat_id) if isinstance(notification_chat_id, str) else notification_chat_id)
+        except Exception:
+            pass
+    
+    # 方法2: 从审计日志中获取最近交互的用户（最近7天）
+    if AUDIT_LOGGER:
+        try:
+            from datetime import datetime, timedelta
+            recent_logs = AUDIT_LOGGER.query_logs(
+                log_type="interactions",
+                start_date=datetime.now() - timedelta(days=7),
+                limit=100,
+            )
+            for log_entry in recent_logs:
+                # 从 metadata 中获取 chat_id，或者从 user_id 推断
+                metadata = log_entry.get("metadata", {})
+                # 如果日志中有 chat_id，使用它
+                if "chat_id" in metadata:
+                    try:
+                        chat_ids.add(int(metadata["chat_id"]))
+                    except Exception:
+                        pass
+                # 否则，如果 source 是 telegram，尝试从 user_id 获取（私聊时 user_id == chat_id）
+                elif log_entry.get("source", "").startswith("telegram"):
+                    user_id = log_entry.get("user_id")
+                    if user_id and user_id != "unknown" and user_id != "email_system":
+                        try:
+                            chat_ids.add(int(user_id))
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.warning("Failed to get chat IDs from audit logs: %s", e)
+    
+    if not chat_ids:
+        logger.info("没有找到可用的 chat_id，邮件通知将不会发送（可以通过配置 telegram.notification_chat_id 或先与机器人对话）")
+        return
+    
+    try:
+        
+        # 构建通知消息
+        message_parts = [f"📧 从邮件创建: {email_subject}"]
+        message_parts.append("")
+        message_parts.append(result.message)
+        
+        if result.events:
+            event_blocks = []
+            for idx, event in enumerate(result.events, start=1):
+                block_lines = [event.to_human_readable()]
+                if idx - 1 < len(result.calendar_links):
+                    link = result.calendar_links[idx - 1]
+                    if link:
+                        block_lines.append(f"链接: {link}")
+                event_blocks.append("\n".join(block_lines))
+            if event_blocks:
+                message_parts.append("")
+                message_parts.append("\n\n".join(event_blocks))
+        
+        if result.tasks:
+            task_blocks = []
+            for idx, task in enumerate(result.tasks, start=1):
+                block_lines = [f"{idx}. {task.to_human_readable()}"]
+                if idx - 1 < len(result.task_links):
+                    link = result.task_links[idx - 1]
+                    if link:
+                        block_lines.append(f"链接: {link}")
+                task_blocks.append("\n".join(block_lines))
+            if task_blocks:
+                message_parts.append("")
+                message_parts.append("✅ 待办事项:\n" + "\n\n".join(task_blocks))
+        
+        message = "\n".join(message_parts)
+        
+        # 使用 bot 发送消息
+        if TELEGRAM_APPLICATION:
+            bot = TELEGRAM_APPLICATION.bot
+        else:
+            bot = Bot(token=TELEGRAM_TOKEN)
+        
+        # 向所有活跃用户发送通知
+        success_count = 0
+        for chat_id in chat_ids:
+            try:
+                await bot.send_message(chat_id=chat_id, text=message)
+                success_count += 1
+            except Exception as send_exc:
+                logger.warning("Failed to send notification to chat_id %s: %s", chat_id, send_exc)
+        
+        if success_count > 0:
+            logger.info("Sent email notification to %d user(s)", success_count)
+        
+        # 记录到审计日志
+        if AUDIT_LOGGER:
+            AUDIT_LOGGER.log_user_interaction(
+                user_id="email_system",
+                username=None,
+                input_text=f"[Email] {email_subject}",
+                output_text=result.message,
+                success=result.success,
+                source="email",
+                metadata={
+                    "events_count": len(result.events) if result.events else 0,
+                    "tasks_count": len(result.tasks) if result.tasks else 0,
+                },
+            )
+    except Exception as exc:
+        logger.exception("Failed to send email notification to Telegram: %s", exc)
 
 
 async def reply_with_result(update: Update, result: AssistantResult):
@@ -957,7 +1092,28 @@ def _ensure_email_ingestor() -> None:
         return
     if EMAIL_INGESTOR:
         EMAIL_INGESTOR.assistant = ASSISTANT
+        # 更新主事件循环（如果 Telegram bot 已经启动）
+        try:
+            loop = asyncio.get_event_loop()
+            if loop and loop.is_running():
+                EMAIL_INGESTOR._main_loop = loop
+        except Exception:
+            pass
         return
+    # 创建通知回调函数
+    async def notification_callback(result, email_subject):
+        await send_email_notification(result, email_subject)
+    
+    # 获取主事件循环（如果 Telegram bot 已经启动）
+    # 注意：事件循环在 bot 启动后才会存在，这里先设为 None，启动后更新
+    main_loop = None
+    try:
+        loop = asyncio.get_event_loop()
+        if loop and loop.is_running():
+            main_loop = loop
+    except Exception:
+        pass
+    
     EMAIL_INGESTOR = EmailEventIngestor(
         host=host,
         username=username,
@@ -966,6 +1122,8 @@ def _ensure_email_ingestor() -> None:
         folder=EMAIL_SETTINGS.get("folder", "INBOX"),
         use_ssl=bool(EMAIL_SETTINGS.get("use_ssl", True)),
         poll_interval=int(EMAIL_SETTINGS.get("poll_interval", 60)),
+        notification_callback=notification_callback,
+        main_event_loop=main_loop,
     )
     EMAIL_INGESTOR.start()
     logger.info("Email ingestion enabled for %s", username)
@@ -990,7 +1148,9 @@ def main():
     if not ASSISTANT:
         logger.warning("助手尚未完成 Google 授权，发送 /google_auth 以继续。")
 
+    global TELEGRAM_APPLICATION
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    TELEGRAM_APPLICATION = application
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("usage", usage_command))
@@ -1007,6 +1167,15 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Smart assistant is up and running.")
+    
+    # 更新邮件处理器的 event loop（在 bot 启动后）
+    if EMAIL_INGESTOR:
+        try:
+            loop = asyncio.get_event_loop()
+            EMAIL_INGESTOR._main_loop = loop
+        except Exception:
+            pass
+    
     application.run_polling(drop_pending_updates=True, close_loop=False)
 
 
