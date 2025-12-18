@@ -38,7 +38,7 @@ class CalendarAutomationAssistant:
     def __init__(
         self,
         parser: OpenAIEventParser,
-        calendar_client,
+        calendar_client: "AppleCalendarClient",
         *,
         task_client=None,
         category_colors: Optional[Dict[str, str]] = None,

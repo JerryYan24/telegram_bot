@@ -10,8 +10,8 @@ from traceback import format_exc
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+# Google Auth imports removed
+
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -26,12 +26,11 @@ from telegram.ext import (
 from smart_assistant import (
     CalendarAutomationAssistant,
     EmailEventIngestor,
-    GoogleCalendarClient,
-    GoogleTaskClient,
+    AppleCalendarClient,
+    AppleTaskClient,
     OpenAIEventParser,
 )
 from smart_assistant.audit_logger import AuditLogger
-from smart_assistant.calendar_client import SCOPES
 from smart_assistant.config import get_config_value, load_config
 from smart_assistant.models import AssistantResult
 
@@ -49,11 +48,9 @@ TELEGRAM_APPLICATION = None  # Telegram bot application instance
 CONFIG: Dict[str, object] = {}
 DEFAULT_TIMEZONE: str = "UTC"
 PARSER: Optional[OpenAIEventParser] = None
-GOOGLE_SETTINGS: Dict[str, object] = {}
+APPLE_SETTINGS: Dict[str, object] = {}
 EMAIL_SETTINGS: Dict[str, object] = {}
 AUDIT_LOGGER: Optional[AuditLogger] = None
-PENDING_OAUTH_FLOWS: Dict[int, Dict[str, object]] = {}
-OOB_REDIRECT_URI = "urn:ietf:wg:oauth:2.0:oob"
 ALLOWED_MODELS: List[str] = []
 CURRENT_MODEL: str = ""
 BASE_VISION_MODEL: Optional[str] = None
@@ -65,7 +62,7 @@ TODAY_CACHE_PATH: str = "today_cache.json"
 
 
 def bootstrap() -> None:
-    global ASSISTANT, EMAIL_INGESTOR, TELEGRAM_TOKEN, CONFIG, DEFAULT_TIMEZONE, PARSER, GOOGLE_SETTINGS, EMAIL_SETTINGS, AUDIT_LOGGER
+    global ASSISTANT, EMAIL_INGESTOR, TELEGRAM_TOKEN, CONFIG, DEFAULT_TIMEZONE, PARSER, APPLE_SETTINGS, EMAIL_SETTINGS, AUDIT_LOGGER
 
     config_path = os.getenv("ASSISTANT_CONFIG_PATH")
     CONFIG = load_config(config_path)
@@ -90,37 +87,18 @@ def bootstrap() -> None:
     openai_base_url = get_config_value(CONFIG, "openai.base_url", "OPENAI_BASE_URL")
     openai_text_model = get_config_value(CONFIG, "openai.text_model", "OPENAI_TEXT_MODEL", "gpt-4o-mini")
     openai_vision_model = get_config_value(CONFIG, "openai.vision_model", "OPENAI_VISION_MODEL")
-    google_client_secrets_path = get_config_value(
-        CONFIG, "google.client_secrets_path", "GOOGLE_CLIENT_SECRETS_PATH"
-    )
-    google_token_path = get_config_value(
-        CONFIG, "google.token_path", "GOOGLE_TOKEN_PATH", "google_token.json"
-    )
-    calendar_id = get_config_value(CONFIG, "google.calendar_id", "GOOGLE_CALENDAR_ID", "primary")
-    task_list_id = get_config_value(CONFIG, "google.task_list_id", "GOOGLE_TASK_LIST_ID", "@default")
+    
+    apple_caldav_url = get_config_value(CONFIG, "apple.caldav_url", "APPLE_CALDAV_URL")
+    apple_username = get_config_value(CONFIG, "apple.username", "APPLE_USERNAME")
+    apple_password = get_config_value(CONFIG, "apple.password", "APPLE_PASSWORD")
+    apple_calendar_name = get_config_value(CONFIG, "apple.calendar_name", "APPLE_CALENDAR_NAME", "Calendar")
+    apple_task_list_name = get_config_value(CONFIG, "apple.task_list_name", "APPLE_TASK_LIST_NAME", "Reminders")
+
     default_timezone = get_config_value(
         CONFIG, "assistant.default_tz", "ASSISTANT_DEFAULT_TZ", "UTC"
     )
     DEFAULT_TIMEZONE = default_timezone
-    category_colors = get_config_value(
-        CONFIG,
-        "google.category_colors",
-        "",
-        default=None,
-        cast=lambda value: value,
-    )
-    if not isinstance(category_colors, dict):
-        category_colors = None
-    default_color_id = get_config_value(CONFIG, "google.default_color_id", "GOOGLE_DEFAULT_COLOR_ID")
-    task_preset_lists = get_config_value(
-        CONFIG,
-        "google.task_preset_lists",
-        "",
-        default=None,
-        cast=lambda value: value,
-    )
-    if not isinstance(task_preset_lists, list):
-        task_preset_lists = []
+    
     allowed_models_raw = get_config_value(
         CONFIG,
         "openai.allowed_models",
@@ -138,8 +116,10 @@ def bootstrap() -> None:
     required = {
         "TELEGRAM_BOT_TOKEN/telegram.bot_token": TELEGRAM_TOKEN,
         "OPENAI_API_KEY/openai.api_key": openai_key,
+        "APPLE_CALDAV_URL/apple.caldav_url": apple_caldav_url,
+        "APPLE_USERNAME/apple.username": apple_username,
+        "APPLE_PASSWORD/apple.password": apple_password,
     }
-    required["GOOGLE_CLIENT_SECRETS_PATH/google.client_secrets_path"] = google_client_secrets_path
     missing = [key for key, value in required.items() if not value]
     if missing:
         raise RuntimeError(f"缺少必要配置: {', '.join(missing)}")
@@ -170,8 +150,8 @@ def bootstrap() -> None:
         base_url=openai_base_url,
         text_model=openai_text_model,
         vision_model=openai_vision_model,
-        allowed_task_lists=task_preset_lists,
-        allowed_event_categories=list((category_colors or {}).keys()),
+        allowed_task_lists=[], # Not strictly used in Apple implementation yet
+        allowed_event_categories=[], # Not strictly used
         persona_text=persona_text,
         usage_path=usage_path,
         audit_logger=AUDIT_LOGGER,  # 传递审计日志器以记录 API 使用量
@@ -188,13 +168,12 @@ def bootstrap() -> None:
     CURRENT_VISION_MODEL = openai_vision_model or openai_text_model
     MODEL_STATE_PATH = model_state_path
     _load_model_state()
-    GOOGLE_SETTINGS = {
-        "client_secrets_path": google_client_secrets_path,
-        "token_path": google_token_path,
-        "calendar_id": calendar_id,
-        "task_list_id": task_list_id,
-        "category_colors": category_colors,
-        "default_color_id": default_color_id,
+    APPLE_SETTINGS = {
+        "caldav_url": apple_caldav_url,
+        "username": apple_username,
+        "password": apple_password,
+        "calendar_name": apple_calendar_name,
+        "task_list_name": apple_task_list_name,
     }
 
     imap_host = get_config_value(CONFIG, "email.imap_host", "ASSISTANT_IMAP_HOST")
@@ -215,20 +194,28 @@ def bootstrap() -> None:
         logger.info("Email ingestion disabled. 在 config.yaml 中填写 email.* 或 ASSISTANT_IMAP_* 以启用。")
 
     calendar_client = None
+    task_client = None
     try:
-        calendar_client = GoogleCalendarClient(
-            calendar_id=calendar_id,
-            client_secrets_path=google_client_secrets_path,
-            token_path=google_token_path,
-            allow_interactive=False,
+        calendar_client = AppleCalendarClient(
+            caldav_url=apple_caldav_url,
+            username=apple_username,
+            password=apple_password,
+            calendar_name=apple_calendar_name,
+            task_list_name=apple_task_list_name
+        )
+        task_client = AppleTaskClient(
+            caldav_url=apple_caldav_url,
+            username=apple_username,
+            password=apple_password,
+            task_list_name=apple_task_list_name
         )
     except Exception as exc:
         logger.warning(
-            "Google OAuth token 未就绪：%s。请在 Telegram 中发送 /google_auth 完成授权。", exc
+            "Apple Calendar connection failed: %s", exc
         )
 
     if calendar_client:
-        _initialize_assistant(calendar_client)
+        _initialize_assistant(calendar_client, task_client)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -385,65 +372,8 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message, reply_markup=keyboard)
 
 
-async def google_auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_key = _flow_owner_id(update)
-    if user_key is None:
-        await update.message.reply_text("无法识别用户，请在私聊或群组中直接使用 /google_auth。")
-        return
+# Google Auth commands removed
 
-    existing_entry = PENDING_OAUTH_FLOWS.pop(user_key, None)
-    if existing_entry:
-        await _delete_auth_prompt(context, existing_entry)
-
-    client_secrets_path = GOOGLE_SETTINGS.get("client_secrets_path")
-    if not client_secrets_path:
-        await update.message.reply_text("缺少 google.client_secrets_path，请先在 config.yaml 中配置。")
-        return
-    try:
-        flow = InstalledAppFlow.from_client_secrets_file(client_secrets_path, SCOPES)
-        flow.redirect_uri = OOB_REDIRECT_URI
-        auth_url, _ = flow.authorization_url(
-            access_type="offline",
-            prompt="consent",
-            include_granted_scopes="true",
-        )
-    except Exception as exc:
-        logger.exception("Failed to create OAuth flow")
-        await update.message.reply_text(f"生成授权链接失败：{exc}")
-        return
-
-    status_line = "当前状态：已授权 ✅（可重新授权）" if ASSISTANT else "当前状态：尚未授权 ❌"
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("取消本次授权", callback_data="cancel_oauth")]]
-    )
-    sent_message = await update.message.reply_text(
-        f"{status_line}\n\n"
-        "请打开以下链接完成 Google 授权：\n\n"
-        f"{auth_url}\n\n"
-        "授权完成后，Google 页面会显示一段 code。复制该 code 后发送命令：\n"
-        "/google_auth_code <code>\n\n"
-        "如果需要重新开始，可再次发送 /google_auth。",
-        reply_markup=keyboard,
-    )
-    PENDING_OAUTH_FLOWS[user_key] = {
-        "flow": flow,
-        "message_id": sent_message.message_id,
-        "chat_id": sent_message.chat_id,
-        "expires_at": datetime.now(timezone.utc) + timedelta(minutes=2),
-    }
-
-
-async def google_auth_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_key = _flow_owner_id(update)
-    if user_key is None:
-        await update.message.reply_text("无法识别用户，请在私聊或群组中直接使用 /google_auth_code。")
-        return
-    if not context.args:
-        await update.message.reply_text("请在命令后附上 Google 页面显示的 code。")
-        return
-
-    raw_code = " ".join(context.args).strip()
-    await _process_oauth_code(user_key, raw_code, update, context, invoked_from_command=True)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -783,27 +713,9 @@ async def reply_with_result(update: Update, result: AssistantResult):
     await update.message.reply_text(message)
 
 
-async def cancel_google_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-    await query.answer()
-    user = query.from_user
-    user_key = user.id if user else None
-    if user_key is None:
-        await query.edit_message_text("无法识别用户，取消操作失败。")
-        return
-    entry = PENDING_OAUTH_FLOWS.pop(user_key, None)
-    if not entry:
-        try:
-            await query.edit_message_text("当前没有待取消的授权请求。")
-        except Exception:
-            pass
-        return
-    chat_id = entry.get("chat_id")
-    await _delete_auth_prompt(context, entry)
-    if chat_id:
-        await context.bot.send_message(chat_id, "已取消本次 Google 授权请求。")
+# cancel_google_auth removed
+
+
 
 
 async def model_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -842,12 +754,7 @@ def _flow_owner_id(update: Update) -> Optional[int]:
     return None
 
 
-def _persist_credentials(creds: Credentials) -> None:
-    token_path = GOOGLE_SETTINGS.get("token_path") or "google_token.json"
-    token_file = Path(token_path).expanduser()
-    token_file.parent.mkdir(parents=True, exist_ok=True)
-    token_file.write_text(creds.to_json())
-    logger.info("Saved Google OAuth token to %s", token_file)
+
 
 
 def _handle_model_switch(target: str) -> str:
@@ -952,120 +859,27 @@ def _apply_current_model_to_parser() -> None:
         PARSER.update_models(text_model=CURRENT_MODEL, vision_model=vision_model)
 
 
-async def _process_oauth_code(
-    user_key: int,
-    raw_code: str,
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    invoked_from_command: bool,
-) -> bool:
-    entry = PENDING_OAUTH_FLOWS.get(user_key)
-    if not entry:
-        if invoked_from_command:
-            await update.message.reply_text("没有待处理的授权请求，请先发送 /google_auth 获取链接。")
-        return False
-
-    expires_at = entry.get("expires_at")
-    if expires_at and datetime.now(timezone.utc) > expires_at:
-        await _delete_auth_prompt(context, entry)
-        PENDING_OAUTH_FLOWS.pop(user_key, None)
-        await update.message.reply_text("授权请求已过期，请重新发送 /google_auth。")
-        return True
-
-    code = GoogleCalendarClient._extract_code(raw_code)
-    if not code:
-        await update.message.reply_text("未检测到有效的 code，请直接粘贴 Google 页面显示的字符串。")
-        return True
-
-    flow: InstalledAppFlow = entry["flow"]
-    try:
-        flow.fetch_token(code=code)
-    except Exception as exc:
-        logger.exception("Failed to exchange OAuth code")
-        PENDING_OAUTH_FLOWS.pop(user_key, None)
-        await _delete_auth_prompt(context, entry)
-        await update.message.reply_text(f"换取 token 失败：{exc}\n请重新发送 /google_auth 再试。")
-        return True
-
-    creds = flow.credentials
-    PENDING_OAUTH_FLOWS.pop(user_key, None)
-    await _delete_auth_prompt(context, entry)
-    try:
-        _persist_credentials(creds)
-    except Exception as exc:
-        logger.exception("Failed to persist OAuth token")
-        await update.message.reply_text(f"保存 token 失败：{exc}")
-        return True
-
-    try:
-        calendar_client = GoogleCalendarClient(
-            calendar_id=GOOGLE_SETTINGS.get("calendar_id", "primary"),
-            client_secrets_path=GOOGLE_SETTINGS.get("client_secrets_path"),
-            token_path=GOOGLE_SETTINGS.get("token_path", "google_token.json"),
-            credentials=creds,
-        )
-    except Exception as exc:
-        logger.exception("Failed to build Google Calendar client after OAuth")
-        await update.message.reply_text(f"初始化 Google Calendar 失败：{exc}")
-        return True
-
-    _initialize_assistant(calendar_client)
-    
-    # 记录授权成功事件
-    if AUDIT_LOGGER:
-        user = update.effective_user
-        AUDIT_LOGGER.log_system_event(
-            event_type="auth_success",
-            description="Google OAuth authorization completed",
-            metadata={
-                "user_id": str(user.id) if user else None,
-                "username": user.username if user else None,
-            },
-        )
-    
-    await update.message.reply_text("Google 授权成功，现在可以开始创建日程了！")
-    return True
+# OAuth helpers removed
 
 
-async def _delete_auth_prompt(context: ContextTypes.DEFAULT_TYPE, entry: Dict[str, object]) -> None:
-    chat_id = entry.get("chat_id")
-    message_id = entry.get("message_id")
-    if not chat_id or not message_id:
-        return
-    try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception:
-        logger.debug("Failed to delete auth prompt message for chat %s", chat_id)
 
 
-def _initialize_assistant(calendar_client: GoogleCalendarClient) -> None:
+
+
+def _initialize_assistant(calendar_client: AppleCalendarClient, task_client: Optional[AppleTaskClient] = None) -> None:
     global ASSISTANT
     if not PARSER:
         raise RuntimeError("OpenAI 事件解析器尚未初始化。")
-
-    task_client = None
-    try:
-        task_list_id = GOOGLE_SETTINGS.get("task_list_id", "@default")
-        preset_lists = GOOGLE_SETTINGS.get("task_preset_lists") or []
-        task_client = GoogleTaskClient(
-            calendar_client.credentials,
-            task_list_id=task_list_id,
-            preset_list_names=preset_lists,
-            max_lists=max(6, len(preset_lists)) or 6,
-        )
-    except Exception as exc:
-        logger.warning("Google Tasks 客户端初始化失败，将仅同步日历：%s", exc)
 
     ASSISTANT = CalendarAutomationAssistant(
         PARSER,
         calendar_client,
         task_client=task_client,
-        category_colors=GOOGLE_SETTINGS.get("category_colors"),
-        default_color_id=GOOGLE_SETTINGS.get("default_color_id"),
+        category_colors=None, # Apple Calendar doesn't support category colors in the same way
+        default_color_id=None,
     )
     _ensure_email_ingestor()
-    logger.info("Google Calendar/Tasks 凭证已就绪，助手完成初始化。")
+    logger.info("Apple Calendar/Tasks 凭证已就绪，助手完成初始化。")
     
     # 记录助手初始化事件
     if AUDIT_LOGGER:
@@ -1074,9 +888,10 @@ def _initialize_assistant(calendar_client: GoogleCalendarClient) -> None:
             description="Calendar automation assistant initialized",
             metadata={
                 "has_task_client": task_client is not None,
-                "calendar_id": calendar_client.calendar_id,
+                "calendar_name": calendar_client._calendar_name,
             },
         )
+
 
 
 def _ensure_email_ingestor() -> None:
@@ -1158,9 +973,8 @@ def main():
     application.add_handler(CallbackQueryHandler(today_regen_cb, pattern="^today_regen$"))
     application.add_handler(CommandHandler("model", model_command))
     application.add_handler(CommandHandler("add_info", add_info_command))
-    application.add_handler(CommandHandler("google_auth", google_auth_command))
-    application.add_handler(CommandHandler("google_auth_code", google_auth_code_command))
-    application.add_handler(CallbackQueryHandler(cancel_google_auth, pattern="^cancel_oauth$"))
+    # Google Auth handlers removed
+
     application.add_handler(CallbackQueryHandler(model_selection_callback, pattern="^model_select:"))
     application.add_handler(CallbackQueryHandler(exit_persona_mode_cb, pattern="^exit_persona_mode$"))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))

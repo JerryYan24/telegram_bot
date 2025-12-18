@@ -1,13 +1,12 @@
 from .assistant import CalendarAutomationAssistant
-from .calendar_client import GoogleCalendarClient
+from .apple_client import AppleCalendarClient, AppleTaskClient
 from .email_ingestor import EmailEventIngestor
 from .openai_parser import OpenAIEventParser
-from .task_client import GoogleTaskClient
 
 __all__ = [
     "CalendarAutomationAssistant",
-    "GoogleCalendarClient",
+    "AppleCalendarClient",
+    "AppleTaskClient",
     "EmailEventIngestor",
     "OpenAIEventParser",
-    "GoogleTaskClient",
 ]

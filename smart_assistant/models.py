@@ -45,51 +45,8 @@ class CalendarEvent:
             return dt.replace(tzinfo=tz)
         return dt.astimezone(tz)
 
-    def to_google_body(self) -> dict:
-        """Convert into Google Calendar event payload."""
-        start_dt = self._normalize_datetime(self.start)
-        end_dt = self._normalize_datetime(self.end)
+    # to_google_body removed
 
-        if self.all_day:
-            start_payload = {"date": start_dt.date().isoformat()}
-            end_payload = {"date": end_dt.date().isoformat()}
-        else:
-            start_payload = {
-                "dateTime": start_dt.isoformat(),
-                "timeZone": self.timezone,
-            }
-            end_payload = {
-                "dateTime": end_dt.isoformat(),
-                "timeZone": self.timezone,
-            }
-
-        # Build description for Google Calendar (without emoji)
-        description_parts = []
-        if self.description:
-            description_parts.append(self.description)
-        if self.attendees:
-            description_parts.append(f"Attendees: {', '.join(self.attendees)}")
-        if self.category:
-            description_parts.append(f"Category: {self.category}")
-        google_description = "\n".join(description_parts) if description_parts else ""
-        
-        body = {
-            "summary": self.title,  # Google Calendar title (no emoji)
-            "start": start_payload,
-            "end": end_payload,
-            "description": google_description,
-        }
-
-        if self.location:
-            body["location"] = self.location
-
-        if self.attendees:
-            body["attendees"] = [{"email": attendee} for attendee in self.attendees]
-
-        if self.color_id:
-            body["colorId"] = str(self.color_id)
-
-        return body
 
     def to_human_readable(self) -> str:
         """Return a friendly string for Telegram responses."""
@@ -159,14 +116,8 @@ class TaskItem:
         except ZoneInfoNotFoundError:
             return ZoneInfo("UTC")
 
-    def to_google_body(self) -> dict:
-        body = {"title": self.title}
-        if self.notes:
-            body["notes"] = self.notes
-        if self.due:
-            due_dt = self._normalize_due(self.due)
-            body["due"] = due_dt.isoformat()
-        return body
+    # to_google_body removed
+
 
     def _normalize_due(self, dt: datetime) -> datetime:
         tz = self._resolve_timezone()

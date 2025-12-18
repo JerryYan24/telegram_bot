@@ -12,23 +12,12 @@ openai:
     - "gpt-4.1-mini"
   model_state_path: "model_state.json"
 
-google:
-  client_secrets_path: "/absolute/path/to/client_secret.json"
-  token_path: "google_token.json"
-  calendar_id: "primary"
-  task_list_id: "@default"
-  task_preset_lists:
-    - "work"
-    - "personal"
-    - "meeting"
-    - "travel"
-    - "finance"
-    - "shopping"
-  category_colors:
-    work: "7"
-    personal: "5"
-    travel: "9"
-  default_color_id: ""
+apple:
+  caldav_url: "https://caldav.icloud.com/"
+  username: "your_apple_id@example.com"
+  password: "your-app-specific-password"
+  calendar_name: "Calendar"
+  task_list_name: "Reminders"
 
 assistant:
   default_tz: "Asia/Shanghai"
